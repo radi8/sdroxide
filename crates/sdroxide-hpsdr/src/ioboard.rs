@@ -90,6 +90,8 @@ const REG_TX_FREQ_BYTE0: u8 = 4;
 /// software clear them at startup rather than inherit whatever the last program
 /// left behind.
 const REG_CONTROL: u8 = 5;
+/// AH-4 tuner status and command register in the Pico firmware.
+const REG_ANTENNA_TUNER: u8 = 7;
 /// Where the board takes its receive signal from: the radio's own input (0, and
 /// what the reset leaves), the board's own J9 SMA (1), or J9 with the J10
 /// PureSignal jack switched in on transmit (2).
@@ -116,6 +118,10 @@ const FREQ_INTERVAL: Duration = Duration::from_millis(500);
 const PROBE_TRIES: u8 = 3;
 /// Gap between those probes.
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+/// How often to read the AH-4 tuner status register.
+const TUNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Maximum time allowed for the initial bypass test.
+const TUNER_INIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One I2C transaction: read or write, one byte either way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,6 +135,9 @@ struct Op {
 impl Op {
     fn write(reg: u8, data: u8) -> Op {
         Op { cookie: I2C_WRITE, addr: IOB_ADDR, reg, data }
+    }
+    fn read(reg: u8) -> Op {
+        Op { cookie: I2C_READ, addr: IOB_ADDR, reg, data: 0 }
     }
 
     /// The five C&C bytes that carry this transaction, with `mox` riding along
@@ -155,6 +164,21 @@ enum Presence {
     Absent,
 }
 
+/// Stages of the AH-4 startup bypass test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TunerInit {
+    /// Startup frequency updates are not yet complete.
+    WaitingForFrequencies,
+    /// Register 7 has been primed with 0xFD.
+    Priming,
+    /// Bypass command 0x02 has been sent.
+    BypassRequested,
+    /// Waiting for the bypass result, 0x00 or 0xFC.
+    VerifyingBypass,
+    /// Initialisation has finished; monitor tuner status.
+    Monitoring,
+}
+
 /// A transaction on the wire, waiting to be acknowledged.
 struct InFlight {
     op: Op,
@@ -166,6 +190,20 @@ struct InFlight {
 /// transmit frequency.
 pub(crate) struct IoBoard {
     presence: Presence,
+    /// Most recently read AH-4 tuner status; None until the first successful read.
+    tuner_status: Option<u8>,
+    /// When the next tuner status read is due.
+    tuner_poll_at: Option<Instant>,
+    /// When initial bypass verification began.
+    tuner_verify_started_at: Option<Instant>,
+    /// Whether an AH-4 tuner has been detected as ready.
+    tuner_present: bool,
+    /// Current stage of the initial AH-4 bypass test.
+    tuner_init: TunerInit,
+    /// Number of initial frequency writes still awaiting acknowledgement.
+    startup_writes_pending: u8,
+    /// Whether the initial frequency batch has been queued.
+    startup_frequencies_queued: bool,
     /// Which input the operator has wired the board for, stated once after the
     /// reset. Only the connection knows this; the board itself comes up at 0.
     rx_input: HpsdrIoRxInput,
@@ -190,6 +228,13 @@ impl IoBoard {
     pub(crate) fn new(rx_input: HpsdrIoRxInput) -> IoBoard {
         IoBoard {
             presence: Presence::Probing(PROBE_TRIES),
+            tuner_status: None,
+            tuner_poll_at: None,
+            tuner_verify_started_at: None,
+            tuner_present: false,
+            tuner_init: TunerInit::WaitingForFrequencies,
+            startup_writes_pending: 0,
+            startup_frequencies_queued: false,
             rx_input,
             inflight: None,
             queue: VecDeque::new(),
@@ -276,33 +321,82 @@ impl IoBoard {
                 }
             }
             Presence::Present => {
+                // Stop initial bypass verification after the timeout.
+                if self.tuner_init == TunerInit::VerifyingBypass
+                    && self
+                        .tuner_verify_started_at
+                        .is_some_and(|started| now >= started + TUNER_INIT_TIMEOUT)
+                {
+                    self.tuner_init = TunerInit::Monitoring;
+                    self.tuner_verify_started_at = None;
+                    self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                    tracing::warn!(
+                        "HL2IOBoard: tuner bypass verification timed out; \
+                         continuing status monitoring"
+                    );
+                }
+
                 let rx_code = hertz_to_code(rx_freq_hz);
                 let tx_stale = self.sent_hz != Some(tx_freq_hz);
                 let rx_stale = self.sent_rx_code != Some(rx_code);
-                if !tx_stale && !rx_stale {
-                    return;
-                }
-                // Rate limit the *sending*, not the value: whatever the
-                // frequency is when the interval expires is what goes out, so a
-                // band change during a fast tune is never the one that gets
-                // dropped.
+
+                // Preserve frequency-update priority and rate limiting.
                 if self.sent_at.is_some_and(|t| now < t + FREQ_INTERVAL) {
+                    if matches!(
+                        self.tuner_init,
+                        TunerInit::VerifyingBypass | TunerInit::Monitoring
+                    ) && self.tuner_poll_at.is_none_or(|t| now >= t)
+                    {
+                        self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                        self.queue
+                            .push_back(Op::read(REG_ANTENNA_TUNER));
+                    }
                     return;
                 }
+
                 self.sent_at = Some(now);
-                // Transmit first: it is the one an amplifier switches on, and
-                // the one that has to be right before any RF appears.
+
+                // Transmit frequency first, as before.
                 if tx_stale {
                     self.sent_hz = Some(tx_freq_hz);
                     self.queue.extend(freq_writes(tx_freq_hz));
-                    tracing::debug!("HL2IOBoard: transmit frequency -> {tx_freq_hz} Hz");
+                    tracing::debug!(
+                        "HL2IOBoard: transmit frequency -> {tx_freq_hz} Hz"
+                    );
                 }
+
                 if rx_stale {
                     self.sent_rx_code = Some(rx_code);
-                    self.queue.push_back(Op::write(REG_FCODE_RX1, rx_code));
+                    self.queue
+                        .push_back(Op::write(REG_FCODE_RX1, rx_code));
                     tracing::debug!(
-                        "HL2IOBoard: receive frequency -> {rx_freq_hz} Hz (code {rx_code})"
+                        "HL2IOBoard: receive frequency -> {rx_freq_hz} Hz \
+                         (code {rx_code})"
                     );
+                }
+
+                // Count the first frequency batch once, not every subsequent change.
+                if !self.startup_frequencies_queued
+                    && self.tuner_init == TunerInit::WaitingForFrequencies
+                {
+                    self.startup_writes_pending = self.queue.len() as u8;
+                    self.startup_frequencies_queued = true;
+                }
+
+                // Do not let a tuner poll jump ahead of queued frequency writes.
+                if !self.queue.is_empty() {
+                    return;
+                }
+
+                // Poll the tuner during bypass verification and normal monitoring.
+                if matches!(
+                    self.tuner_init,
+                    TunerInit::VerifyingBypass | TunerInit::Monitoring
+                ) && self.tuner_poll_at.is_none_or(|t| now >= t)
+                {
+                    self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                    self.queue
+                        .push_back(Op::read(REG_ANTENNA_TUNER));
                 }
             }
             Presence::Absent => {}
@@ -357,6 +451,104 @@ impl IoBoard {
                 self.sent_at = None;
             } else {
                 self.probe_failed(now, &format!("unexpected version byte 0x{:02X}", data[0]));
+            }
+        }
+
+        // Count acknowledged initial frequency writes.
+        if self.tuner_init == TunerInit::WaitingForFrequencies
+            && self.startup_writes_pending > 0
+            && f.op.cookie == I2C_WRITE
+            && ((0..=REG_TX_FREQ_BYTE0).contains(&f.op.reg)
+                || f.op.reg == REG_FCODE_RX1)
+        {
+            self.startup_writes_pending -= 1;
+
+            if self.startup_writes_pending == 0 {
+                self.tuner_init = TunerInit::Priming;
+                tracing::debug!(
+                    "HL2IOBoard: initial frequency writes complete; priming tuner status"
+                );
+                self.queue
+                    .push_back(Op::write(REG_ANTENNA_TUNER, 0xFD));
+            }
+        }
+
+        // Advance the tuner startup sequence only after its writes are acknowledged.
+        if f.op.cookie == I2C_WRITE && f.op.reg == REG_ANTENNA_TUNER {
+            match (self.tuner_init, f.op.data) {
+                (TunerInit::Priming, 0xFD) => {
+                    self.tuner_init = TunerInit::BypassRequested;
+                    self.queue
+                        .push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+                    tracing::debug!(
+                        "HL2IOBoard: tuner status primed; requesting bypass"
+                    );
+                }
+                (TunerInit::BypassRequested, 0x02) => {
+                    self.tuner_init = TunerInit::VerifyingBypass;
+                    self.tuner_verify_started_at = Some(now);
+                    self.tuner_poll_at = Some(now);
+                    self.queue
+                        .push_back(Op::read(REG_ANTENNA_TUNER));
+                    tracing::debug!(
+                        "HL2IOBoard: bypass requested; checking tuner status"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Save reads of the AH-4 tuner status register and interpret the
+        // result of the initial bypass test.
+        if f.op.cookie == I2C_READ && f.op.reg == REG_ANTENNA_TUNER {
+            let status = data[0];
+            self.tuner_status = Some(status);
+
+            tracing::debug!(
+                "HL2IOBoard: antenna tuner status -> 0x{:02X}",
+                status
+            );
+
+            match self.tuner_init {
+                TunerInit::VerifyingBypass => {
+                    match status {
+                        0x00 => {
+                            self.tuner_present = true;
+                            self.tuner_init = TunerInit::Monitoring;
+                            self.tuner_verify_started_at = None;
+                            self.tuner_poll_at =
+                                Some(now + TUNER_POLL_INTERVAL);
+                            tracing::info!(
+                                "HL2IOBoard: AH-4 tuner responded; bypass succeeded"
+                            );
+                        }
+                        0xFC => {
+                            self.tuner_present = true;
+                            self.tuner_init = TunerInit::Monitoring;
+                            self.tuner_verify_started_at = None;
+                            self.tuner_poll_at =
+                                Some(now + TUNER_POLL_INTERVAL);
+                            tracing::warn!(
+                                "HL2IOBoard: AH-4 tuner responded, but bypass failed"
+                            );
+                        }
+                        _ => {
+                            // 0xFD means the firmware is still waiting.
+                            // Other values are retained for diagnosis while
+                            // verification continues until its timeout.
+                            self.tuner_poll_at =
+                                Some(now + TUNER_POLL_INTERVAL);
+                        }
+                    }
+                }
+                TunerInit::Monitoring => {
+                    // A recognised tuner response confirms detection.
+                    if status == 0x00 || status == 0xFC {
+                        self.tuner_present = true;
+                    }
+                    self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                }
+                _ => {}
             }
         }
     }
@@ -454,6 +646,33 @@ mod tests {
         probe
     }
 
+    fn complete_tuner_priming(board: &mut IoBoard, now: Instant) {
+        // Acknowledge the priming marker.
+        let cc = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("tuner priming request");
+        assert_eq!(cc[3], REG_ANTENNA_TUNER);
+        assert_eq!(cc[4], 0xFD);
+        ack(board, now, [0; 4]);
+
+        // Acknowledge the bypass request.
+        let cc = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("tuner bypass request");
+        assert_eq!(cc[3], REG_ANTENNA_TUNER);
+        assert_eq!(cc[4], 0x02);
+        ack(board, now, [0; 4]);
+
+        // Acknowledge the status read.
+        let cc = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("tuner status read");
+        assert_eq!(cc[1], I2C_READ);
+        assert_eq!(cc[2], IOB_ADDR);
+        assert_eq!(cc[3], REG_ANTENNA_TUNER);
+        ack(board, now, [0x00, 0, 0, 0]);
+    }
+
     #[test]
     fn probe_reads_the_version_register_and_then_resets_the_board() {
         let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
@@ -471,6 +690,71 @@ mod tests {
         assert_eq!(reset[2], IOB_ADDR);
         assert_eq!(reset[3], REG_CONTROL);
         assert_eq!(reset[4], 1);
+    }
+
+    #[test]
+    fn tuner_status_read_is_recorded_exactly() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+
+        find(&mut board, now);
+
+        // Complete the startup reset and frequency writes.
+        for _ in 0..6 {
+            let request = board
+                .next_request(now, RX_HZ, RX_HZ, 0)
+                .expect("startup request");
+            ack(&mut board, now, [0; 4]);
+
+            if request[3] == REG_FCODE_RX1 {
+                break;
+            }
+        }
+
+        // Simulate a successful read of the tuner status register.
+        board.inflight = Some(InFlight {
+            op: Op::read(REG_ANTENNA_TUNER),
+            sent_at: now,
+            tries: 0,
+        });
+        ack(&mut board, now, [0xFD, 0, 0, 0]);
+
+        assert_eq!(board.tuner_status, Some(0xFD));
+    }
+
+    #[test]
+    fn tuner_initialisation_waits_for_startup_frequency_writes() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let mut now = Instant::now();
+
+        find(&mut board, now);
+
+        // Complete the reset and initial frequency writes.
+        for _ in 0..7 {
+            let request = board
+                .next_request(now, RX_HZ, RX_HZ, 0)
+                .expect("startup request");
+            ack(&mut board, now, [0; 4]);
+            now += Duration::from_millis(3);
+
+            if request[3] == REG_FCODE_RX1 {
+                break;
+            }
+        }
+
+        // The initial frequencies are complete. Now acknowledge the
+        // tuner-status priming write.
+        let request = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("tuner priming request");
+
+        assert_eq!(request[3], REG_ANTENNA_TUNER);
+        assert_eq!(request[4], 0xFD);
+
+        ack(&mut board, now, [0; 4]);
+        now += Duration::from_millis(3);
+
+        assert_eq!(board.tuner_init, TunerInit::BypassRequested);
     }
 
     /// `REG_RF_INPUTS` is the operator's answer to "what is wired to the board's
@@ -589,8 +873,19 @@ mod tests {
         ack(&mut board, now, [0; 4]);
         assert_eq!((rx[3], rx[4]), (REG_FCODE_RX1, hertz_to_code(RX_HZ)));
 
-        // Nothing more to say while the dial sits still.
+        now += Duration::from_millis(3);
+        complete_tuner_priming(&mut board, now);
+
+        // The dial is still, but periodic tuner-status polling continues.
         now += FREQ_INTERVAL * 2;
+        let status = board
+            .next_request(now, 14_074_000, RX_HZ, 0)
+            .expect("periodic tuner status poll");
+        assert_eq!(status[1], I2C_READ);
+        assert_eq!(status[3], REG_ANTENNA_TUNER);
+        ack(&mut board, now, [0x00, 0, 0, 0]);
+
+        // No further traffic is due at this instant.
         assert_eq!(board.next_request(now, 14_074_000, RX_HZ, 0), None);
     }
 
@@ -628,11 +923,19 @@ mod tests {
             board.next_request(now, 14_074_000, 14_074_000, 0).expect("startup traffic");
             ack(&mut board, now, [0; 4]);
         }
-        // Tuning around 20 m: the transmit frequency is unchanged here, and the
-        // receive code does not move either, so the bus stays silent.
+        now += Duration::from_millis(3);
+        complete_tuner_priming(&mut board, now);
+        // Tuning around 20 m does not change the transmit frequency or receive
+        // code, but periodic tuner-status polling continues.
         for hz in [14_000_000, 14_050_000, 14_100_000, 14_074_000] {
             now += FREQ_INTERVAL;
-            assert_eq!(board.next_request(now, 14_074_000, hz, 0), None, "still 20 m at {hz}");
+            let status = board
+                .next_request(now, 14_074_000, hz, 0)
+                .expect("periodic tuner status poll");
+            assert_eq!(status[1], I2C_READ, "expected a status read at {hz}");
+            assert_eq!(status[3], REG_ANTENNA_TUNER);
+            ack(&mut board, now, [0x00, 0, 0, 0]);
+            assert_eq!(board.next_request(now, 14_074_000, hz, 0), None, "no extra traffic at {hz}");
         }
         // Moving to 40 m says it, once.
         now += FREQ_INTERVAL;
@@ -640,7 +943,17 @@ mod tests {
         ack(&mut board, now, [0; 4]);
         assert_eq!((cc[3], cc[4]), (REG_FCODE_RX1, 92));
         now += FREQ_INTERVAL;
-        assert_eq!(board.next_request(now, 14_074_000, 7_100_000, 0), None, "still 40 m");
+        let status = board
+            .next_request(now, 14_074_000, 7_100_000, 0)
+            .expect("periodic tuner status poll");
+        assert_eq!(status[1], I2C_READ);
+        assert_eq!(status[3], REG_ANTENNA_TUNER);
+        ack(&mut board, now, [0x00, 0, 0, 0]);
+        assert_eq!(
+            board.next_request(now, 14_074_000, 7_100_000, 0),
+            None,
+            "no extra traffic while still on 40 m"
+        );
     }
 
     #[test]
@@ -657,13 +970,26 @@ mod tests {
             ack(&mut board, now, [0; 4]);
         }
 
+        now += Duration::from_millis(3);
+        complete_tuner_priming(&mut board, now);
         // A band change inside the rate-limit window is held, not dropped...
         now += Duration::from_millis(50);
         assert_eq!(board.next_request(now, 14_074_000, RX_HZ, 0), None, "too soon");
-        // ...and a second change on top of it simply replaces the first: what
-        // goes out when the window opens is where the operator actually is.
+
+        // ...and a second change replaces the first. At 100 ms, the
+        // periodic tuner-status poll is due, so service it before continuing.
         now += Duration::from_millis(50);
-        assert_eq!(board.next_request(now, 21_074_000, RX_HZ, 0), None, "still too soon");
+        let status = board
+            .next_request(now, 21_074_000, RX_HZ, 0)
+            .expect("periodic tuner status poll");
+        assert_eq!(status[1], I2C_READ);
+        assert_eq!(status[3], REG_ANTENNA_TUNER);
+        ack(&mut board, now, [0x00, 0, 0, 0]);
+        assert_eq!(
+            board.next_request(now, 21_074_000, RX_HZ, 0),
+            None,
+            "frequency change is still rate-limited"
+        );
         now += FREQ_INTERVAL;
         let cc = board.next_request(now, 21_074_000, RX_HZ, 0).expect("the held change goes out");
         assert_eq!(cc[3], REG_TX_FREQ_BYTE4);
