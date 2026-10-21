@@ -520,6 +520,7 @@ fn stop_stream(socket: &UdpSocket, dest: SocketAddr, radio: IpAddr, conn_id: u64
 /// Run the Protocol 1 network loop until told to shut down.
 pub(crate) fn run(ctx: ThreadCtx) {
     let ThreadCtx {
+        tuner_status,
         socket,
         radio,
         opened_at,
@@ -784,6 +785,16 @@ pub(crate) fn run(ctx: ThreadCtx) {
                         && let Some(b) = io_board.as_mut()
                     {
                         b.on_ack(raddr, data, Instant::now());
+
+                        let published_status = if b.tuner_present() {
+                            b.tuner_status()
+                                .map(u16::from)
+                                .unwrap_or(0x100)
+                        } else {
+                            0x100
+                        };
+
+                        tuner_status.store(published_status, Ordering::Relaxed);
                     }
                     // The radio's own PTT input (a Hermes-Lite's CN4 ring, a
                     // foot switch, a mic button). Published as a level for

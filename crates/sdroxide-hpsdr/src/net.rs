@@ -666,6 +666,7 @@ pub(crate) struct ThreadCtx {
     pub rev_power_raw: Arc<AtomicU16>,
     pub tx: Consumer<f32>,
     pub ctrl: Receiver<Ctrl>,
+    pub tuner_status: Arc<AtomicU16>,
 }
 
 /// What [`ThreadCtx::temp_centi_c`] holds before a board has reported a
@@ -730,6 +731,8 @@ struct DevInner {
     temp_centi_c: Arc<AtomicI32>,
     fwd_power_raw: Arc<AtomicU16>,
     rev_power_raw: Arc<AtomicU16>,
+    /// Latest verified AH-4 tuner status; 0x100 means unavailable.
+    tuner_status: Arc<AtomicU16>,
     /// The TX ring's feed end, claimable exactly once — by DDC 0's stream.
     tx_endpoint: Mutex<Option<Producer<f32>>>,
     /// Which DDCs have a live [`HpsdrRx`], so one cannot be vended twice: two
@@ -772,6 +775,7 @@ impl HpsdrBoard {
         io_rx_input: HpsdrIoRxInput,
         auto_gain: AutoGain,
     ) -> Result<HpsdrBoard, HpsdrError> {
+        let tuner_status = Arc::new(AtomicU16::new(0x100));
         tracing::info!("HPSDR: opening {ip}, requested RX rate {sample_rate_hz:.0} Hz");
         let (board, protocol) = match discovery::probe(ip, Duration::from_millis(800)) {
             Some(dev) => {
@@ -896,6 +900,7 @@ impl HpsdrBoard {
             );
         }
         let ctx = ThreadCtx {
+            tuner_status: Arc::clone(&tuner_status),
             socket,
             radio: IpAddr::V4(ip),
             opened_at,
@@ -951,6 +956,7 @@ impl HpsdrBoard {
                 temp_centi_c,
                 fwd_power_raw,
                 rev_power_raw,
+                tuner_status,
                 tx_endpoint: Mutex::new(Some(tx_prod)),
                 attached: Mutex::new(std::collections::HashSet::new()),
             }),
@@ -1289,7 +1295,11 @@ impl HpsdrRx {
             centi => Some(centi as f32 / 100.0),
         }
     }
-
+    /// Latest AH-4 tuner status, or None until a tuner has been verified.
+    pub fn tuner_status(&self) -> Option<u8> {
+        let status = self.dev.tuner_status.load(Ordering::Relaxed);
+        (status <= u8::MAX as u16).then_some(status as u8)
+    }
     /// Stop transmitting.
     pub fn tx_end(&self) {
         if self.tx.is_some() {

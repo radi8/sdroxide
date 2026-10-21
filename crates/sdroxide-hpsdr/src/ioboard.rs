@@ -225,6 +225,14 @@ pub(crate) struct IoBoard {
 }
 
 impl IoBoard {
+    pub(crate) fn tuner_status(&self) -> Option<u8> {
+        self.tuner_status
+    }
+
+    pub(crate) fn tuner_present(&self) -> bool {
+        self.tuner_present
+    }
+
     pub(crate) fn new(rx_input: HpsdrIoRxInput) -> IoBoard {
         IoBoard {
             presence: Presence::Probing(PROBE_TRIES),
