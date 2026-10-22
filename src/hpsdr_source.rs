@@ -63,6 +63,8 @@ pub struct HpsdrSource {
     /// wants an edge.
     ptt: bool,
     label: String,
+    /// Last AH-4 tuner status reported through poll_control().
+    last_tuner_status: Option<Option<u8>>,
     /// See [`sdroxide_types::HpsdrConfig::tx_latency_ms`].
     tx_latency_ms: f64,
 
@@ -257,6 +259,7 @@ impl HpsdrSource {
             ps_log_at: Instant::now(),
             ps_warned_offset: false,
             io_rx_input,
+            last_tuner_status: None,
         })
     }
 
@@ -550,12 +553,21 @@ impl IqSource for HpsdrSource {
     /// Only changes are reported. A released stream answers `false`, which
     /// unkeys rather than leaving an over hanging on a line nobody is reading.
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
+        let mut updates = Vec::new();
+
         let ptt = self.rx.as_ref().is_some_and(|rx| rx.radio_ptt());
-        if ptt == self.ptt {
-            return Vec::new();
+        if ptt != self.ptt {
+            self.ptt = ptt;
+            updates.push(ControlUpdate::Ptt(ptt));
         }
-        self.ptt = ptt;
-        vec![ControlUpdate::Ptt(ptt)]
+
+        let tuner_status = self.rx.as_ref().and_then(|rx| rx.tuner_status());
+        if self.last_tuner_status != Some(tuner_status) {
+            self.last_tuner_status = Some(tuner_status);
+            updates.push(ControlUpdate::TunerStatus(tuner_status));
+        }
+
+        updates
     }
 
     /// Load the transmit frequency while receiving, so an HL2IOBoard on the

@@ -389,6 +389,9 @@ pub enum RadioEvent {
     ///
     /// Appended last, for the usual reason.
     Pi4Spots(Vec<crate::Pi4Spot>),
+    /// Latest verified AH-4 tuner status; None means unavailable.
+    /// Appended last, for the usual reason.
+    TunerStatus(Option<u8>),
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

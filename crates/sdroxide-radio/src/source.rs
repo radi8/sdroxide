@@ -110,6 +110,8 @@ pub enum ControlUpdate {
     /// So the engine *observes* it: the meter follows the over and shows its
     /// SWR, and sdroxide will not key on top of it. It does not transmit.
     RigTx(bool),
+    /// Latest verified AH-4 tuner status. None means unavailable.
+    TunerStatus(Option<u8>),
 }
 
 /// Anything that produces a stream of complex baseband samples: a live

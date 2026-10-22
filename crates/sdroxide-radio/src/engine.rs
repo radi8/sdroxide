@@ -6083,6 +6083,9 @@ impl Engine {
                 }
             }
             ControlUpdate::Ptt(closed) => self.apply_hw_ptt(closed),
+            ControlUpdate::TunerStatus(status) => {
+                let _ = self.event_tx.send(RadioEvent::TunerStatus(status));
+            }
             // An over the operator started at the radio. Recorded, never
             // answered: see [`ControlUpdate::RigTx`] for why keying along with
             // it would talk over the person holding the microphone.

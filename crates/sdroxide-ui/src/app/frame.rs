@@ -1340,6 +1340,10 @@ impl SdroxideApp {
                     ));
                     self.login_tests.insert(r.target, r);
                 }
+                RadioEvent::TunerStatus(status) => {
+                    self.tuner_status = status;
+                    self.tuner_status_at = status.map(|_| now);
+                }
                 RadioEvent::Notice(n) => {
                     if self.focused {
                         self.speech.announcer.on_notice(n.as_deref(), now);

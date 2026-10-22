@@ -4395,13 +4395,29 @@ impl SdroxideApp {
     }
 
     /// The TUNE latching chip: keys a carrier at the tune level drawn beside
-    /// it.
+    /// it. A tuner status temporarily replaces the label for three seconds.
     fn tx_tune_chip(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let tx = self.state.tx;
+        let now = ui.input(|i| i.time);
+        let label = match (self.tuner_status, self.tuner_status_at) {
+            (Some(status), Some(shown_at)) => {
+                let elapsed = now - shown_at;
+                if (0.0..3.0).contains(&elapsed) {
+                    ui.ctx().request_repaint_after(
+                        std::time::Duration::from_secs_f64(3.0 - elapsed),
+                    );
+                    format!(" {status:02X} ")
+                } else {
+                    " TUNE ".to_string()
+                }
+            }
+            _ => " TUNE ".to_string(),
+        };
+
         if crate::chrome::chip_accent_sized(
             ui,
             tx.tune,
-            RichText::new(" TUNE ").size(15.0),
+            RichText::new(label).size(15.0),
             crate::theme::YELLOW(),
             crate::theme::INK_ON_CYAN(),
             tx_key_chip_size(ui),

@@ -2005,6 +2005,9 @@ pub enum ServerMsg {
     ///
     /// Appended last, for the usual reason.
     Pi4Spots(Vec<sdroxide_types::Pi4Spot>),
+    /// `RadioEvent::TunerStatus`: latest verified AH-4 tuner status.
+    /// Appended last, for the usual reason.
+    TunerStatus(Option<u8>),
 }
 
 /// One radio in a station's roster, as a client sees it.

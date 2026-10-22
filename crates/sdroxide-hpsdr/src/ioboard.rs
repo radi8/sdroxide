@@ -122,6 +122,10 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const TUNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum time allowed for the initial bypass test.
 const TUNER_INIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum time allowed for an AH-4 tuning cycle.
+const TUNER_START_TIMEOUT: Duration = Duration::from_secs(4);
+/// Maximum time allowed for AH-4 bypass recovery.
+const TUNER_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One I2C transaction: read or write, one byte either way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,6 +181,10 @@ enum TunerInit {
     VerifyingBypass,
     /// Initialisation has finished; monitor tuner status.
     Monitoring,
+    /// Bypass recovery has been queued and awaits write acknowledgement.
+    RecoveryBypassRequested,
+    /// Waiting for the recovery bypass status to become idle.
+    RecoveringBypass,
 }
 
 /// A transaction on the wire, waiting to be acknowledged.
@@ -192,12 +200,24 @@ pub(crate) struct IoBoard {
     presence: Presence,
     /// Most recently read AH-4 tuner status; None until the first successful read.
     tuner_status: Option<u8>,
+    /// Whether an AH-4 start request is outstanding.
+    tuner_start_pending: bool,
+    /// Whether a non-idle status has been observed for this request.
+    tuner_start_seen_active: bool,
+    /// When the start request was accepted.
+    tuner_start_started_at: Option<Instant>,
     /// When the next tuner status read is due.
     tuner_poll_at: Option<Instant>,
     /// When initial bypass verification began.
     tuner_verify_started_at: Option<Instant>,
+    /// When AH-4 bypass recovery began.
+    tuner_recovery_started_at: Option<Instant>,
     /// Whether an AH-4 tuner has been detected as ready.
     tuner_present: bool,
+    /// A latched fault prevents new tuning requests until recovery is verified.
+    tuner_fault: bool,
+    /// Blocks I2C traffic when an acknowledgement leaves transaction state uncertain.
+    i2c_quarantined: bool,
     /// Current stage of the initial AH-4 bypass test.
     tuner_init: TunerInit,
     /// Number of initial frequency writes still awaiting acknowledgement.
@@ -233,13 +253,68 @@ impl IoBoard {
         self.tuner_present
     }
 
+    /// Queue an AH-4 start command only for a verified, idle tuner.
+    /// This method never enables transmitter RF.
+    pub(crate) fn tuner_start(&mut self) -> bool {
+        // Only start from a verified, idle state with no other I2C work
+        // outstanding. The status check is still subject to freshness review.
+        if self.i2c_quarantined
+            || self.presence != Presence::Present
+            || !self.tuner_present
+            || self.tuner_fault
+            || self.tuner_init != TunerInit::Monitoring
+            || self.tuner_status != Some(0x00)
+            || self.tuner_start_pending
+            || self.inflight.is_some()
+            || !self.queue.is_empty()
+        {
+            return false;
+        }
+
+        self.queue
+            .push_back(Op::write(REG_ANTENNA_TUNER, 0x01));
+
+        self.tuner_start_pending = true;
+        self.tuner_start_seen_active = false;
+
+        tracing::info!("HL2IOBoard: AH-4 start command queued");
+        true
+    }
+
+    /// Request AH-4 bypass recovery without enabling transmitter RF.
+    pub(crate) fn tuner_recover(&mut self) -> bool {
+        if self.i2c_quarantined
+            || self.presence != Presence::Present
+            || !self.tuner_fault
+            || self.tuner_start_pending
+            || self.inflight.is_some()
+            || !self.queue.is_empty()
+            || self.tuner_init != TunerInit::Monitoring
+        {
+            return false;
+        }
+
+        self.queue
+            .push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+        self.tuner_init = TunerInit::RecoveryBypassRequested;
+
+        tracing::warn!("HL2IOBoard: AH-4 bypass recovery requested");
+        true
+    }
+
     pub(crate) fn new(rx_input: HpsdrIoRxInput) -> IoBoard {
         IoBoard {
             presence: Presence::Probing(PROBE_TRIES),
             tuner_status: None,
+            tuner_start_pending: false,
+            tuner_start_seen_active: false,
+            tuner_start_started_at: None,
             tuner_poll_at: None,
             tuner_verify_started_at: None,
+            tuner_recovery_started_at: None,
             tuner_present: false,
+            tuner_fault: false,
+            i2c_quarantined: false,
             tuner_init: TunerInit::WaitingForFrequencies,
             startup_writes_pending: 0,
             startup_frequencies_queued: false,
@@ -288,16 +363,71 @@ impl IoBoard {
         rx_freq_hz: u64,
         mox: u8,
     ) -> Option<[u8; 5]> {
+        // After an uncertain ACK, no further I2C request is safe.
+        if self.i2c_quarantined {
+            return None;
+        }
+
+        if self.tuner_start_pending
+            && self
+                .tuner_start_started_at
+                .is_some_and(|started| now >= started + TUNER_START_TIMEOUT)
+        {
+            tracing::error!(
+                "HL2IOBoard: AH-4 tuning timed out; tuner state is uncertain"
+            );
+            self.tuner_start_pending = false;
+            self.tuner_start_seen_active = false;
+            self.tuner_start_started_at = None;
+            self.tuner_present = false;
+            self.tuner_fault = true;
+        }
+
+        if self.tuner_init == TunerInit::RecoveringBypass
+            && self
+                .tuner_recovery_started_at
+                .is_some_and(|started| now >= started + TUNER_RECOVERY_TIMEOUT)
+        {
+            tracing::error!(
+                "HL2IOBoard: AH-4 bypass recovery timed out; fault remains latched"
+            );
+            self.tuner_init = TunerInit::Monitoring;
+            self.tuner_recovery_started_at = None;
+            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+            self.tuner_fault = true;
+        }
+
         // A request still waiting on its answer holds the bus: the protocol
         // document asks for one outstanding request at a time.
+        //
+        // An AH-4 start command is not an ordinary idempotent register update.
+        // If its ACK is lost, the tuner may nevertheless have received it.
+        // Do not retransmit it: abandon the request and latch a fault because
+        // the tuner's state is uncertain.
+        if self.inflight.as_ref().is_some_and(|f| {
+            now >= f.sent_at + ACK_TIMEOUT
+                && f.op.cookie == I2C_WRITE
+                && f.op.reg == REG_ANTENNA_TUNER
+                && f.op.data == 0x01
+        }) {
+            let op = self.inflight.take().expect("checked above").op;
+            self.give_up(
+                op,
+                now,
+                "AH-4 start acknowledgement timed out; outcome uncertain",
+            );
+            self.i2c_quarantined = true;
+            tracing::error!("HL2IOBoard: I2C bus quarantined after uncertain AH-4 start acknowledgement");
+            return None;
+        }
+
         if let Some(f) = self.inflight.as_mut() {
             if now < f.sent_at + ACK_TIMEOUT {
                 return None;
             }
             f.tries += 1;
             if f.tries < MAX_TRIES {
-                // EP2 is UDP: a request can simply have been lost, and sending
-                // the same one-byte write again is harmless either way.
+                // Ordinary register updates retain the existing retry policy.
                 f.sent_at = now;
                 return Some(f.op.cc(mox));
             }
@@ -307,6 +437,15 @@ impl IoBoard {
 
         self.refill(now, tx_freq_hz, rx_freq_hz);
         let op = self.queue.pop_front()?;
+
+        if op.cookie == I2C_WRITE
+            && op.reg == REG_ANTENNA_TUNER
+            && op.data == 0x01
+        {
+            self.tuner_start_started_at = Some(now);
+            tracing::info!("HL2IOBoard: AH-4 start command sent");
+        }
+
         self.inflight = Some(InFlight { op, sent_at: now, tries: 0 });
         Some(op.cc(mox))
     }
@@ -414,6 +553,11 @@ impl IoBoard {
     /// An acknowledgement came back on EP6. `raddr` is the address the gateware
     /// echoed and `data` is C1..C4 — for a read, the four bytes it fetched.
     pub(crate) fn on_ack(&mut self, raddr: u8, data: [u8; 4], now: Instant) {
+        // ACKs cannot be safely associated with requests after an uncertain timeout.
+        if self.i2c_quarantined {
+            return;
+        }
+
         // Only ACKs for the I2C bus this drives are ours. Nothing else in this
         // crate sets RQST, but taking someone else's answer would strand the
         // real request forever.
@@ -502,20 +646,53 @@ impl IoBoard {
                         "HL2IOBoard: bypass requested; checking tuner status"
                     );
                 }
+                (TunerInit::RecoveryBypassRequested, 0x02) => {
+                    self.tuner_init = TunerInit::RecoveringBypass;
+                    self.tuner_recovery_started_at = Some(now);
+                    self.tuner_poll_at = Some(now);
+                    self.queue
+                        .push_back(Op::read(REG_ANTENNA_TUNER));
+                    tracing::info!(
+                        "HL2IOBoard: recovery bypass acknowledged; checking tuner status"
+                    );
+                }
                 _ => {}
             }
         }
 
         // Save reads of the AH-4 tuner status register and interpret the
         // result of the initial bypass test.
+        if f.op.cookie == I2C_READ {
+            tracing::info!(
+                "HL2IOBoard: I2C read register {} ACK bytes C1..C4 = {:02X} {:02X} {:02X} {:02X}",
+                f.op.reg,
+                data[0],
+                data[1],
+                data[2],
+                data[3]
+            );
+        }
+
         if f.op.cookie == I2C_READ && f.op.reg == REG_ANTENNA_TUNER {
-            let status = data[0];
+            tracing::info!(
+                "HL2IOBoard: tuner read ACK bytes C1..C4 = {:02X} {:02X} {:02X} {:02X}",
+                data[0],
+                data[1],
+                data[2],
+                data[3]
+            );
+            let status = data[3];
+            let previous_status = self.tuner_status;
             self.tuner_status = Some(status);
 
-            tracing::debug!(
-                "HL2IOBoard: antenna tuner status -> 0x{:02X}",
-                status
-            );
+            if matches!(self.tuner_init, TunerInit::VerifyingBypass)
+                || previous_status != Some(status)
+            {
+                tracing::info!(
+                    "HL2IOBoard: tuner status register read: 0x{:02X}",
+                    status
+                );
+            }
 
             match self.tuner_init {
                 TunerInit::VerifyingBypass => {
@@ -554,10 +731,86 @@ impl IoBoard {
                     if status == 0x00 || status == 0xFC {
                         self.tuner_present = true;
                     }
+
+                    if self.tuner_start_pending {
+                        match status {
+                            0x00 if self.tuner_start_seen_active => {
+                                self.tuner_start_pending = false;
+                                self.tuner_start_seen_active = false;
+                                self.tuner_start_started_at = None;
+                                tracing::info!(
+                                    "HL2IOBoard: AH-4 tuning cycle completed"
+                                );
+                            }
+                            0x00 => {
+                                // The tuner may not have started yet.
+                            }
+                            0xEE => {
+                                self.tuner_start_seen_active = true;
+                                tracing::info!(
+                                    "HL2IOBoard: AH-4 requests tuning RF"
+                                );
+                            }
+                            0xFC | 0xFD => {
+                                self.tuner_start_pending = false;
+                                self.tuner_start_seen_active = false;
+                                self.tuner_start_started_at = None;
+                                self.tuner_fault = true;
+                                tracing::warn!(
+                                    "HL2IOBoard: AH-4 tuning failed or reset; status 0x{:02X}",
+                                    status
+                                );
+                            }
+                            0xF0..=0xFF => {
+                                self.tuner_start_pending = false;
+                                self.tuner_start_seen_active = false;
+                                self.tuner_start_started_at = None;
+                                self.tuner_fault = true;
+                                tracing::warn!(
+                                    "HL2IOBoard: AH-4 returned an unrecognised terminal status 0x{:02X}",
+                                    status
+                                );
+                            }
+                            _ => {
+                                // Intermediate tuner status.
+                                self.tuner_start_seen_active = true;
+                            }
+                        }
+                    }
+
                     self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                }
+                TunerInit::RecoveringBypass => {
+                    match status {
+                        0x00 => {
+                            self.tuner_present = true;
+                            self.tuner_fault = false;
+                            self.tuner_init = TunerInit::Monitoring;
+                            self.tuner_recovery_started_at = None;
+                            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                            tracing::info!(
+                                "HL2IOBoard: AH-4 bypass recovery succeeded; fault cleared"
+                            );
+                        }
+                        0xF0..=0xFF => {
+                            self.tuner_init = TunerInit::Monitoring;
+                            self.tuner_recovery_started_at = None;
+                            self.tuner_fault = true;
+                            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                            tracing::warn!(
+                                "HL2IOBoard: AH-4 bypass recovery failed; status 0x{:02X}; fault remains latched",
+                                status
+                            );
+                        }
+                        _ => {
+                            // Keep waiting for a definitive recovery result.
+                            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                        }
+                    }
                 }
                 _ => {}
             }
+
         }
     }
 
@@ -571,12 +824,51 @@ impl IoBoard {
         // have been the one that latches — so forget that it was ever sent and
         // say the whole five bytes again from the top.
         self.queue.clear();
+        if op.cookie == I2C_WRITE
+            && op.reg == REG_ANTENNA_TUNER
+            && op.data == 0x01
+        {
+            self.tuner_start_pending = false;
+            self.tuner_start_seen_active = false;
+            self.tuner_start_started_at = None;
+            self.tuner_fault = true;
+            tracing::warn!("HL2IOBoard: AH-4 start request failed at the I2C layer");
+        }
+        if self.tuner_init == TunerInit::RecoveryBypassRequested
+            && op.cookie == I2C_WRITE
+            && op.reg == REG_ANTENNA_TUNER
+            && op.data == 0x02
+        {
+            self.tuner_init = TunerInit::Monitoring;
+            self.tuner_recovery_started_at = None;
+            self.tuner_fault = true;
+            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+            tracing::warn!(
+                "HL2IOBoard: AH-4 recovery bypass write failed; fault remains latched"
+            );
+        } else if self.tuner_init == TunerInit::RecoveringBypass
+            && op.cookie == I2C_READ
+            && op.reg == REG_ANTENNA_TUNER
+        {
+            self.tuner_init = TunerInit::Monitoring;
+            self.tuner_recovery_started_at = None;
+            self.tuner_fault = true;
+            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+            tracing::warn!(
+                "HL2IOBoard: AH-4 recovery status read failed; fault remains latched"
+            );
+        }
         self.sent_hz = None;
         self.sent_rx_code = None;
         self.sent_at = None;
+        let operation = match op.cookie {
+            I2C_READ => "read",
+            I2C_WRITE => "write",
+            _ => "unknown operation",
+        };
+
         tracing::warn!(
-            "HL2IOBoard: I2C write to register {} failed ({why}); sending the transmit \
-             frequency again",
+            "HL2IOBoard: I2C {operation} of register {} failed ({why}); sending the transmit frequency again",
             op.reg
         );
     }
@@ -681,6 +973,223 @@ mod tests {
         ack(board, now, [0x00, 0, 0, 0]);
     }
 
+    /// A present, idle board with a latched tuner fault and an empty bus.
+    fn faulted_idle_board() -> IoBoard {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        board.presence = Presence::Present;
+        board.tuner_init = TunerInit::Monitoring;
+        board.tuner_present = true;
+        board.tuner_status = Some(0x00);
+        board.tuner_fault = true;
+        board
+    }
+
+    #[test]
+    fn tuner_start_ack_timeout_quarantines_the_i2c_bus() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+        board.tuner_fault = false;
+
+        assert!(board.tuner_start());
+
+        let first = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("initial tuner start");
+        assert_eq!((first[3], first[4]), (REG_ANTENNA_TUNER, 0x01));
+
+        // The uncertain start ACK timeout must latch both fault and quarantine.
+        assert!(
+            board.next_request(now + ACK_TIMEOUT, RX_HZ, RX_HZ, 0).is_none(),
+            "no request may be sent after the uncertain start ACK"
+        );
+        assert!(board.tuner_fault, "uncertain outcome must latch a fault");
+        assert!(board.i2c_quarantined, "uncertain ACK must quarantine the bus");
+        assert!(!board.tuner_start_pending);
+        assert!(board.inflight.is_none(), "timed-out start must leave in-flight state");
+
+        // Even if work appears in the queue later, quarantine blocks transmission.
+        board.queue.push_back(Op::write(REG_CONTROL, 1));
+        assert!(
+            board.next_request(now + ACK_TIMEOUT + Duration::from_millis(1), RX_HZ, RX_HZ, 0).is_none(),
+            "quarantine must block subsequent I2C requests"
+        );
+        assert_eq!(board.queue.len(), 1, "queued work must remain unsent");
+    }
+
+    #[test]
+    fn late_ack_is_ignored_while_i2c_bus_is_quarantined() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+
+        board.i2c_quarantined = true;
+        board.queue.push_back(Op::write(REG_CONTROL, 1));
+
+        // A delayed ACK must not alter the quarantined board state.
+        ack(&mut board, now, [0; 4]);
+
+        assert!(board.i2c_quarantined, "late ACK must not clear quarantine");
+        assert!(board.inflight.is_none());
+        assert_eq!(board.queue.len(), 1, "queued work must remain untouched");
+        assert!(
+            board.next_request(now + Duration::from_millis(1), RX_HZ, RX_HZ, 0).is_none(),
+            "no request may be sent after a late ACK"
+        );
+        assert_eq!(board.queue.len(), 1, "queued work must remain unsent");
+        assert!(!board.tuner_start(), "tuner start must remain blocked");
+        assert!(!board.tuner_recover(), "tuner recovery must remain blocked");
+    }
+
+    #[test]
+    fn tuner_start_requires_a_present_ready_idle_board_and_empty_bus() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+        board.tuner_fault = false;
+
+        // A board that is not currently present must reject the request.
+        board.presence = Presence::Probing(PROBE_TRIES);
+        assert!(!board.tuner_start());
+
+        // An outstanding transaction must also block the request.
+        board.presence = Presence::Present;
+        board.inflight = Some(InFlight {
+            op: Op::read(REG_ANTENNA_TUNER),
+            sent_at: now,
+            tries: 0,
+        });
+        assert!(!board.tuner_start());
+
+        // A queued operation must block the request as well.
+        board.inflight = None;
+        board.queue.push_back(Op::write(REG_CONTROL, 1));
+        assert!(!board.tuner_start());
+
+        // Once the bus is idle, the verified tuner may accept a start.
+        board.queue.clear();
+        assert!(board.tuner_start());
+        assert!(board.tuner_start_pending);
+        assert_eq!(
+            board.queue.front().copied(),
+            Some(Op::write(REG_ANTENNA_TUNER, 0x01))
+        );
+    }
+
+    #[test]
+    fn tuner_recovery_requires_a_latched_fault_and_an_idle_bus() {
+        let mut board = faulted_idle_board();
+        board.tuner_fault = false;
+        assert!(!board.tuner_recover(), "no fault to recover");
+
+        board.tuner_fault = true;
+        board.inflight = Some(InFlight {
+            op: Op::read(REG_ANTENNA_TUNER),
+            sent_at: Instant::now(),
+            tries: 0,
+        });
+        assert!(!board.tuner_recover(), "transaction in flight");
+
+        board.inflight = None;
+        board.queue.push_back(Op::write(REG_CONTROL, 1));
+        assert!(!board.tuner_recover(), "queued operation");
+    }
+
+    #[test]
+    fn tuner_recovery_clears_fault_only_after_idle_status_is_confirmed() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+
+        assert!(board.tuner_recover());
+        assert!(board.tuner_fault, "request alone must not clear the fault");
+
+        let write = board.next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("recovery bypass write");
+        assert_eq!(write[1], I2C_WRITE);
+        assert_eq!((write[3], write[4]), (REG_ANTENNA_TUNER, 0x02));
+        ack(&mut board, now, [0; 4]);
+
+        assert_eq!(board.tuner_init, TunerInit::RecoveringBypass);
+        assert!(board.tuner_fault);
+
+        let read = board.next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("recovery status read");
+        assert_eq!(read[1], I2C_READ);
+        assert_eq!(read[3], REG_ANTENNA_TUNER);
+        ack(&mut board, now, [0, 0, 0, 0x00]);
+
+        assert!(!board.tuner_fault);
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+        assert_eq!(board.tuner_status, Some(0x00));
+    }
+
+    #[test]
+    fn tuner_recovery_terminal_failure_keeps_fault_latched() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+
+        assert!(board.tuner_recover());
+        board.next_request(now, RX_HZ, RX_HZ, 0).expect("bypass write");
+        ack(&mut board, now, [0; 4]);
+        board.next_request(now, RX_HZ, RX_HZ, 0).expect("status read");
+        ack(&mut board, now, [0, 0, 0, 0xFC]);
+
+        assert!(board.tuner_fault);
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+    }
+
+    #[test]
+    fn tuner_recovery_timeout_keeps_fault_latched() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+        board.tuner_init = TunerInit::RecoveringBypass;
+        board.tuner_recovery_started_at = Some(now);
+
+        let _ = board.next_request(
+            now + TUNER_RECOVERY_TIMEOUT,
+            RX_HZ,
+            RX_HZ,
+            0,
+        );
+
+        assert!(board.tuner_fault);
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+        assert_eq!(board.tuner_recovery_started_at, None);
+    }
+
+    #[test]
+    fn tuner_recovery_bypass_write_failure_keeps_fault_latched() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+        board.tuner_init = TunerInit::RecoveryBypassRequested;
+
+        board.give_up(
+            Op::write(REG_ANTENNA_TUNER, 0x02),
+            now,
+            "test failure",
+        );
+
+        assert!(board.tuner_fault);
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+        assert_eq!(board.tuner_recovery_started_at, None);
+    }
+
+    #[test]
+    fn tuner_recovery_status_read_failure_keeps_fault_latched() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+        board.tuner_init = TunerInit::RecoveringBypass;
+        board.tuner_recovery_started_at = Some(now);
+
+        board.give_up(
+            Op::read(REG_ANTENNA_TUNER),
+            now,
+            "test failure",
+        );
+
+        assert!(board.tuner_fault);
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+        assert_eq!(board.tuner_recovery_started_at, None);
+    }
+
+
     #[test]
     fn probe_reads_the_version_register_and_then_resets_the_board() {
         let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
@@ -725,7 +1234,7 @@ mod tests {
             sent_at: now,
             tries: 0,
         });
-        ack(&mut board, now, [0xFD, 0, 0, 0]);
+        ack(&mut board, now, [0, 0, 0, 0xFD]);
 
         assert_eq!(board.tuner_status, Some(0xFD));
     }

@@ -412,6 +412,9 @@ impl RemoteController {
             ServerMsg::Ft8Decodes(d) => self.pending.push_back(RadioEvent::Ft8Decodes(d)),
             ServerMsg::WsprSpots(s) => self.pending.push_back(RadioEvent::WsprSpots(s)),
             ServerMsg::Pi4Spots(s) => self.pending.push_back(RadioEvent::Pi4Spots(s)),
+            ServerMsg::TunerStatus(s) => {
+                self.pending.push_back(RadioEvent::TunerStatus(s))
+            }
             ServerMsg::Ft8Status(s) => self.pending.push_back(RadioEvent::Ft8Status(s)),
             ServerMsg::Ft8QsoLogged(r) => self.pending.push_back(RadioEvent::Ft8QsoLogged(r)),
             ServerMsg::SkimmerSpots(s) => self.pending.push_back(RadioEvent::SkimmerSpots(s)),

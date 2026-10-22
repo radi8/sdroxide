@@ -716,6 +716,21 @@ pub(crate) fn run(ctx: ThreadCtx) {
                         tracing::debug!("HPSDR P1: TX NCO -> {hz} Hz (not keyed)");
                     }
                 }
+                Ctrl::TunerStart => {
+                    if !regs.ptt {
+                        if let Some(board) = io_board.as_mut() {
+                            if !board.tuner_start() {
+                                tracing::warn!(
+                                    "HPSDR P1: AH-4 start rejected; tuner not ready"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "HPSDR P1: AH-4 start rejected; transmitter active"
+                        );
+                    }
+                }
                 Ctrl::TxOn(hz) => {
                     regs.tx_freq = hz.max(0.0) as u32;
                     regs.ptt = true;

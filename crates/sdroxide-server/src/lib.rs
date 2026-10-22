@@ -274,6 +274,8 @@ pub(crate) struct Latest {
     /// every change, and replayed on connect for the same reason as
     /// `memories`: a client that attaches later would otherwise offer nothing.
     pub profiles: Vec<String>,
+    /// Latest verified AH-4 tuner status; None means unavailable.
+    pub tuner_status: Option<u8>,
 }
 
 /// Everything the routes are served out of: the station's radios and the
@@ -1245,6 +1247,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::Profiles(p) => {
                 latest.profiles = p.clone();
                 Some(ServerMsg::Profiles(p))
+            }
+            RadioEvent::TunerStatus(status) => {
+                latest.tuner_status = status;
+                Some(ServerMsg::TunerStatus(status))
             }
         }
     };

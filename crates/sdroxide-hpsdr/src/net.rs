@@ -461,6 +461,9 @@ pub(crate) enum Ctrl {
     TxFreq(f64),
     TxOn(f64),
     TxOff,
+    /// Request AH-4 tuning through the HL2 I/O board.
+    /// Does not enable MOX or transmit RF.
+    TunerStart,
     Shutdown,
 }
 
@@ -1299,6 +1302,13 @@ impl HpsdrRx {
     pub fn tuner_status(&self) -> Option<u8> {
         let status = self.dev.tuner_status.load(Ordering::Relaxed);
         (status <= u8::MAX as u16).then_some(status as u8)
+    }
+    /// Request an AH-4 tuning cycle without keying the transmitter.
+    /// The Protocol 1 thread verifies tuner availability.
+    pub fn tuner_start(&self) {
+        if self.tx.is_some() {
+            let _ = self.dev.ctrl.send(Ctrl::TunerStart);
+        }
     }
     /// Stop transmitting.
     pub fn tx_end(&self) {
