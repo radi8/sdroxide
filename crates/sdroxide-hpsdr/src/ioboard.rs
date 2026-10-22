@@ -116,6 +116,8 @@ const PROBE_TRIES: u8 = 3;
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// How often to read the AH-4 tuner status register.
 const TUNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Maximum age of a successful status read when authorising a tuning start.
+const TUNER_STATUS_MAX_AGE: Duration = Duration::from_millis(200);
 /// Maximum time allowed for the initial bypass test.
 const TUNER_INIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum time allowed for an AH-4 tuning cycle.
@@ -195,6 +197,8 @@ pub(crate) struct IoBoard {
     presence: Presence,
     /// Most recently read AH-4 tuner status; None until the first successful read.
     tuner_status: Option<u8>,
+    /// Time of the most recent successful AH-4 tuner status read.
+    tuner_status_at: Option<Instant>,
     /// Whether an AH-4 start request is outstanding.
     tuner_start_pending: bool,
     /// Whether a non-idle status has been observed for this request.
@@ -252,13 +256,15 @@ impl IoBoard {
     /// This method never enables transmitter RF.
     pub(crate) fn tuner_start(&mut self) -> bool {
         // Only start from a verified, idle state with no other I2C work
-        // outstanding. The status check is still subject to freshness review.
+        // outstanding, and with a sufficiently recent status reading.
         if self.i2c_quarantined
             || self.presence != Presence::Present
             || !self.tuner_present
             || self.tuner_fault
             || self.tuner_init != TunerInit::Monitoring
             || self.tuner_status != Some(0x00)
+            || self.tuner_status_at.is_none_or(|t|
+                Instant::now().saturating_duration_since(t) > TUNER_STATUS_MAX_AGE)
             || self.tuner_start_pending
             || self.inflight.is_some()
             || !self.queue.is_empty()
@@ -301,6 +307,7 @@ impl IoBoard {
         IoBoard {
             presence: Presence::Probing(PROBE_TRIES),
             tuner_status: None,
+            tuner_status_at: None,
             tuner_start_pending: false,
             tuner_start_seen_active: false,
             tuner_start_started_at: None,
@@ -404,6 +411,7 @@ impl IoBoard {
             let op = f.op;
             self.give_up(op, now, "no acknowledgement within timeout");
             self.tuner_status = None;
+            self.tuner_status_at = None;
             if self.tuner_present || op.reg == REG_ANTENNA_TUNER {
                 self.tuner_fault = true;
             }
@@ -546,6 +554,10 @@ impl IoBoard {
         };
         if raddr == RADDR_ERROR {
             // Nothing acknowledged that I2C address, or the bus was busy.
+            if f.op.cookie == I2C_READ && f.op.reg == REG_ANTENNA_TUNER {
+                self.tuner_status = None;
+                self.tuner_status_at = None;
+            }
             self.give_up(f.op, now, "the radio reported an I2C error");
             return;
         }
@@ -663,6 +675,7 @@ impl IoBoard {
             let status = data[3];
             let previous_status = self.tuner_status;
             self.tuner_status = Some(status);
+            self.tuner_status_at = Some(now);
 
             if matches!(self.tuner_init, TunerInit::VerifyingBypass)
                 || previous_status != Some(status)
@@ -959,6 +972,7 @@ mod tests {
         board.tuner_init = TunerInit::Monitoring;
         board.tuner_present = true;
         board.tuner_status = Some(0x00);
+        board.tuner_status_at = Some(Instant::now());
         board.tuner_fault = true;
         board
     }
@@ -1016,6 +1030,46 @@ mod tests {
         assert_eq!(board.queue.len(), 1, "queued work must remain unsent");
         assert!(!board.tuner_start(), "tuner start must remain blocked");
         assert!(!board.tuner_recover(), "tuner recovery must remain blocked");
+    }
+
+    #[test]
+    fn tuner_start_rejects_stale_idle_status() {
+        let mut board = faulted_idle_board();
+        board.tuner_fault = false;
+        board.tuner_status_at = Some(
+            Instant::now() - TUNER_STATUS_MAX_AGE - Duration::from_millis(1)
+        );
+
+        assert!(
+            !board.tuner_start(),
+            "an old idle status must not authorise tuning"
+        );
+
+        board.tuner_status_at = Some(Instant::now());
+        assert!(
+            board.tuner_start(),
+            "a fresh idle status may authorise tuning"
+        );
+    }
+
+    #[test]
+    fn tuner_status_read_error_invalidates_previous_status() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+        board.tuner_fault = false;
+        board.inflight = Some(InFlight {
+            op: Op::read(REG_ANTENNA_TUNER),
+            sent_at: now,
+        });
+
+        board.on_ack(RADDR_ERROR, [0; 4], now);
+
+        assert_eq!(board.tuner_status, None);
+        assert_eq!(board.tuner_status_at, None);
+        assert!(
+            !board.tuner_start(),
+            "a failed status read must not authorise tuning"
+        );
     }
 
     #[test]
@@ -1213,6 +1267,7 @@ mod tests {
         ack(&mut board, now, [0, 0, 0, 0xFD]);
 
         assert_eq!(board.tuner_status, Some(0xFD));
+        assert_eq!(board.tuner_status_at, Some(now));
     }
 
     #[test]
