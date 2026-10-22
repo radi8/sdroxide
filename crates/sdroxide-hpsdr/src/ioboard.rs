@@ -106,10 +106,6 @@ const REG_FCODE_RX1: u8 = 13;
 
 /// How long to wait for an ACK before sending the request again.
 const ACK_TIMEOUT: Duration = Duration::from_millis(150);
-/// Attempts per transaction before it is abandoned. Three tries inside the
-/// half-second frequency cadence, so a retry can never collide with the next
-/// frequency.
-const MAX_TRIES: u8 = 3;
 /// Minimum spacing between transmit-frequency updates. The board's
 /// documentation asks for at most one every half second (Quisk's figure), since
 /// an operator spinning the dial would otherwise flood the I2C bus.
@@ -191,7 +187,6 @@ enum TunerInit {
 struct InFlight {
     op: Op,
     sent_at: Instant,
-    tries: u8,
 }
 
 /// Drives one HL2IOBoard: finds it, resets it, and keeps it told of the
@@ -397,42 +392,26 @@ impl IoBoard {
             self.tuner_fault = true;
         }
 
-        // A request still waiting on its answer holds the bus: the protocol
-        // document asks for one outstanding request at a time.
-        //
-        // An AH-4 start command is not an ordinary idempotent register update.
-        // If its ACK is lost, the tuner may nevertheless have received it.
-        // Do not retransmit it: abandon the request and latch a fault because
-        // the tuner's state is uncertain.
-        if self.inflight.as_ref().is_some_and(|f| {
-            now >= f.sent_at + ACK_TIMEOUT
-                && f.op.cookie == I2C_WRITE
-                && f.op.reg == REG_ANTENNA_TUNER
-                && f.op.data == 0x01
-        }) {
-            let op = self.inflight.take().expect("checked above").op;
-            self.give_up(
-                op,
-                now,
-                "AH-4 start acknowledgement timed out; outcome uncertain",
-            );
-            self.i2c_quarantined = true;
-            tracing::error!("HL2IOBoard: I2C bus quarantined after uncertain AH-4 start acknowledgement");
-            return None;
-        }
-
-        if let Some(f) = self.inflight.as_mut() {
+        // An unanswered request leaves the I2C transaction outcome uncertain.
+        // Do not retry or send another request until the bus is recovered.
+        if let Some(f) = self.inflight.as_ref() {
             if now < f.sent_at + ACK_TIMEOUT {
                 return None;
             }
-            f.tries += 1;
-            if f.tries < MAX_TRIES {
-                // Ordinary register updates retain the existing retry policy.
-                f.sent_at = now;
-                return Some(f.op.cc(mox));
+        }
+
+        if let Some(f) = self.inflight.take() {
+            let op = f.op;
+            self.give_up(op, now, "no acknowledgement within timeout");
+            self.tuner_status = None;
+            if self.tuner_present || op.reg == REG_ANTENNA_TUNER {
+                self.tuner_fault = true;
             }
-            let op = self.inflight.take().expect("checked above").op;
-            self.give_up(op, now, "no answer");
+            self.i2c_quarantined = true;
+            tracing::error!(
+                "HL2IOBoard: I2C bus quarantined after an unanswered request"
+            );
+            return None;
         }
 
         self.refill(now, tx_freq_hz, rx_freq_hz);
@@ -446,7 +425,7 @@ impl IoBoard {
             tracing::info!("HL2IOBoard: AH-4 start command sent");
         }
 
-        self.inflight = Some(InFlight { op, sent_at: now, tries: 0 });
+        self.inflight = Some(InFlight { op, sent_at: now });
         Some(op.cc(mox))
     }
 
@@ -1054,7 +1033,6 @@ mod tests {
         board.inflight = Some(InFlight {
             op: Op::read(REG_ANTENNA_TUNER),
             sent_at: now,
-            tries: 0,
         });
         assert!(!board.tuner_start());
 
@@ -1083,7 +1061,6 @@ mod tests {
         board.inflight = Some(InFlight {
             op: Op::read(REG_ANTENNA_TUNER),
             sent_at: Instant::now(),
-            tries: 0,
         });
         assert!(!board.tuner_recover(), "transaction in flight");
 
@@ -1232,7 +1209,6 @@ mod tests {
         board.inflight = Some(InFlight {
             op: Op::read(REG_ANTENNA_TUNER),
             sent_at: now,
-            tries: 0,
         });
         ack(&mut board, now, [0, 0, 0, 0xFD]);
 
@@ -1521,28 +1497,30 @@ mod tests {
     }
 
     #[test]
-    fn an_unanswered_write_is_retried_and_then_re_sent_with_the_next_update() {
+    fn an_unanswered_write_quarantines_the_bus_without_retrying() {
         let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
         let mut now = Instant::now();
         find(&mut board, now);
-        board.next_request(now, 7_074_000, RX_HZ, 0); // the reset
+        board.next_request(now, 7_074_000, RX_HZ, 0).expect("reset");
         ack(&mut board, now, [0; 4]);
 
-        let first = board.next_request(now, 7_074_000, RX_HZ, 0).expect("first frequency byte");
-        // Nothing answers. It is re-sent, unchanged, up to the try limit.
-        for _ in 1..MAX_TRIES {
-            now += ACK_TIMEOUT;
-            assert_eq!(
-                board.next_request(now, 7_074_000, RX_HZ, 0),
-                Some(first),
-                "retried verbatim"
-            );
-        }
-        // Then abandoned — and because the board's idea of the frequency is now
-        // unknown, the next poll says it again rather than assuming it landed.
+        let first = board.next_request(now, 7_074_000, RX_HZ, 0)
+            .expect("first frequency byte");
         now += ACK_TIMEOUT;
-        let retry = board.next_request(now, 7_074_000, RX_HZ, 0).expect("says it again");
-        assert_eq!(retry[3], REG_TX_FREQ_BYTE4, "starting from the top");
+
+        assert_eq!(
+            board.next_request(now, 7_074_000, RX_HZ, 0),
+            None,
+            "timed-out request must not be retransmitted"
+        );
+        assert!(board.i2c_quarantined);
+        assert!(board.inflight.is_none());
+        assert_eq!(
+            board.next_request(now + ACK_TIMEOUT, 7_074_000, RX_HZ, 0),
+            None,
+            "quarantine must block further requests"
+        );
+        assert_eq!(first[3], REG_TX_FREQ_BYTE4);
     }
 
     #[test]
