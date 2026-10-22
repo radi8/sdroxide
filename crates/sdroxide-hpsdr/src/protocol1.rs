@@ -30,8 +30,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::net::{
-    Ctrl, RxStats, SeqTracker, ThreadCtx, board_has_lna_gain, board_is_hermes_lite, hex_head,
-    lna_gain_code, push_iq,
+    Ctrl, RxStats, SeqTracker, ThreadCtx, board_has_lna_gain, board_is_hermes_lite,
+    encode_tuner_status, hex_head, lna_gain_code, push_iq,
 };
 use crate::protocol2::be24_to_f32;
 use sdroxide_types::HpsdrOcPlan;
@@ -801,15 +801,22 @@ pub(crate) fn run(ctx: ThreadCtx) {
                     {
                         b.on_ack(raddr, data, Instant::now());
 
-                        let published_status = if b.tuner_present() {
-                            b.tuner_status()
-                                .map(u16::from)
+                        let published = if b.tuner_present() {
+                            b.tuner_status_snapshot()
+                                .map(|(status, status_at)| {
+                                    encode_tuner_status(
+                                        u16::from(status),
+                                        status_at
+                                            .saturating_duration_since(opened_at)
+                                            .as_micros() as u64,
+                                    )
+                                })
                                 .unwrap_or(0x100)
                         } else {
                             0x100
                         };
 
-                        tuner_status.store(published_status, Ordering::Relaxed);
+                        tuner_status.store(published, Ordering::Release);
                     }
                     // The radio's own PTT input (a Hermes-Lite's CN4 ring, a
                     // foot switch, a mic button). Published as a level for

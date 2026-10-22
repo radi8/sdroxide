@@ -244,8 +244,9 @@ pub(crate) struct IoBoard {
 }
 
 impl IoBoard {
-    pub(crate) fn tuner_status(&self) -> Option<u8> {
-        self.tuner_status
+    /// Return the last successfully read tuner status and its original timestamp.
+    pub(crate) fn tuner_status_snapshot(&self) -> Option<(u8, Instant)> {
+        self.tuner_status.zip(self.tuner_status_at)
     }
 
     pub(crate) fn tuner_present(&self) -> bool {
@@ -1268,6 +1269,7 @@ mod tests {
 
         assert_eq!(board.tuner_status, Some(0xFD));
         assert_eq!(board.tuner_status_at, Some(now));
+        assert_eq!(board.tuner_status_snapshot(), Some((0xFD, now)));
     }
 
     #[test]

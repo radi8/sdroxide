@@ -669,7 +669,7 @@ pub(crate) struct ThreadCtx {
     pub rev_power_raw: Arc<AtomicU16>,
     pub tx: Consumer<f32>,
     pub ctrl: Receiver<Ctrl>,
-    pub tuner_status: Arc<AtomicU16>,
+    pub tuner_status: Arc<AtomicU64>,
 }
 
 /// What [`ThreadCtx::temp_centi_c`] holds before a board has reported a
@@ -692,6 +692,43 @@ const HL2_SWR_GAMMA_CAL: f32 = 1.23;
 /// the top of the range the SWR guard can be set to, so a pegged bridge trips
 /// it at any limit. The same ceiling the Icom meter curve ends at.
 const HL2_SWR_MAX: f32 = sdroxide_types::SWR_LIMIT_MAX;
+
+
+/// Maximum age of an AH-4 status accepted by the live transmit-control path.
+const TUNER_STATUS_MAX_AGE_US: u64 = 200_000;
+
+/// Pack a verified status and its publication time into one atomic value.
+/// The low nine bits hold the status; 0x100 remains the unavailable sentinel.
+pub(crate) fn encode_tuner_status(status: u16, elapsed_us: u64) -> u64 {
+    if status > u8::MAX as u16 {
+        0x100
+    } else {
+        (elapsed_us << 9) | u64::from(status)
+    }
+}
+
+/// Reject unavailable, stale, or disconnected tuner status.
+fn decode_tuner_status(
+    published: u64,
+    alive: bool,
+    now_elapsed_us: u64,
+) -> Option<u8> {
+    if !alive {
+        return None;
+    }
+
+    let status = (published & 0x1ff) as u16;
+    if status > u8::MAX as u16 {
+        return None;
+    }
+
+    let published_at_us = published >> 9;
+    if now_elapsed_us.saturating_sub(published_at_us) > TUNER_STATUS_MAX_AGE_US {
+        return None;
+    }
+
+    Some(status as u8)
+}
 
 /// What every stream of one connection shares. Dropping the last handle stops
 /// the stream and shuts the network thread down.
@@ -735,7 +772,7 @@ struct DevInner {
     fwd_power_raw: Arc<AtomicU16>,
     rev_power_raw: Arc<AtomicU16>,
     /// Latest verified AH-4 tuner status; 0x100 means unavailable.
-    tuner_status: Arc<AtomicU16>,
+    tuner_status: Arc<AtomicU64>,
     /// The TX ring's feed end, claimable exactly once — by DDC 0's stream.
     tx_endpoint: Mutex<Option<Producer<f32>>>,
     /// Which DDCs have a live [`HpsdrRx`], so one cannot be vended twice: two
@@ -778,7 +815,7 @@ impl HpsdrBoard {
         io_rx_input: HpsdrIoRxInput,
         auto_gain: AutoGain,
     ) -> Result<HpsdrBoard, HpsdrError> {
-        let tuner_status = Arc::new(AtomicU16::new(0x100));
+        let tuner_status = Arc::new(AtomicU64::new(0x100));
         tracing::info!("HPSDR: opening {ip}, requested RX rate {sample_rate_hz:.0} Hz");
         let (board, protocol) = match discovery::probe(ip, Duration::from_millis(800)) {
             Some(dev) => {
@@ -1298,10 +1335,14 @@ impl HpsdrRx {
             centi => Some(centi as f32 / 100.0),
         }
     }
-    /// Latest AH-4 tuner status, or None until a tuner has been verified.
+    /// Latest AH-4 tuner status, but only while its acknowledgement is fresh.
     pub fn tuner_status(&self) -> Option<u8> {
-        let status = self.dev.tuner_status.load(Ordering::Relaxed);
-        (status <= u8::MAX as u16).then_some(status as u8)
+        let published = self.dev.tuner_status.load(Ordering::Acquire);
+        decode_tuner_status(
+            published,
+            self.is_alive(),
+            self.dev.opened_at.elapsed().as_micros() as u64,
+        )
     }
     /// Request an AH-4 tuning cycle without keying the transmitter.
     /// The Protocol 1 thread verifies tuner availability.
@@ -1754,5 +1795,66 @@ mod hl2_swr_regression_tests {
     fn no_forward_drive_has_no_meaningful_swr() {
         assert_eq!(hl2_swr_from_raw(0, 0), None);
         assert_eq!(hl2_swr_from_raw(6, 0), None);
+    }
+}
+
+
+#[cfg(test)]
+mod tuner_status_freshness_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_status_is_available() {
+        let published = encode_tuner_status(0xEE, 1_000_000);
+        assert_eq!(
+            decode_tuner_status(published, true, 1_100_000),
+            Some(0xEE)
+        );
+    }
+
+    #[test]
+    fn status_at_age_limit_is_available() {
+        let published = encode_tuner_status(0xEE, 1_000_000);
+        assert_eq!(
+            decode_tuner_status(
+                published,
+                true,
+                1_000_000 + TUNER_STATUS_MAX_AGE_US
+            ),
+            Some(0xEE)
+        );
+    }
+
+    #[test]
+    fn stale_status_is_unavailable() {
+        let published = encode_tuner_status(0xEE, 1_000_000);
+        assert_eq!(
+            decode_tuner_status(
+                published,
+                true,
+                1_000_001 + TUNER_STATUS_MAX_AGE_US
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_status_is_rejected() {
+        assert_eq!(decode_tuner_status(0x100, true, 1_000_000), None);
+        assert_eq!(encode_tuner_status(0x100, 1_000_000), 0x100);
+    }
+
+    #[test]
+    fn dead_connection_invalidates_even_fresh_status() {
+        let published = encode_tuner_status(0xEE, 1_000_000);
+        assert_eq!(decode_tuner_status(published, false, 1_000_001), None);
+    }
+
+    #[test]
+    fn different_status_and_timestamp_are_published_together() {
+        let published = encode_tuner_status(0x00, 1_234_567);
+        assert_eq!(published & 0x1ff, 0x00);
+        assert_eq!(published >> 9, 1_234_567);
+        assert_eq!(decode_tuner_status(published, true, 1_234_568), Some(0x00));
     }
 }
