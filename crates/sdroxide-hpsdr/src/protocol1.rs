@@ -343,6 +343,7 @@ struct Ep6Info {
 struct TxHealth {
     last_inhibit_warn: Option<Instant>,
     last_fifo_warn: Option<Instant>,
+    tx_started_at: Option<Instant>,
 }
 
 impl TxHealth {
@@ -369,6 +370,12 @@ impl TxHealth {
 ///   on the air is being chopped; overflow means we are sending it too fast.
 ///   Otherwise `RDATA[14:8]` is the FIFO's fill level.
 fn hl2_status(c1: u8, c3: u8, keyed: bool, health: &mut TxHealth) {
+    if keyed {
+        health.tx_started_at.get_or_insert_with(Instant::now);
+    } else {
+        health.tx_started_at = None;
+    }
+
     if c1 & 0x02 == 0 && TxHealth::due(&mut health.last_inhibit_warn) {
         tracing::warn!(
             "HPSDR P1: the Hermes-Lite reports TRANSMIT INHIBITED — something is holding its \
@@ -376,9 +383,18 @@ fn hl2_status(c1: u8, c3: u8, keyed: bool, health: &mut TxHealth) {
              released."
         );
     }
-    // The FIFO legitimately sits empty until the first over, so this is only a
-    // fault while keyed.
-    if keyed && c3 & 0x80 != 0 && TxHealth::due(&mut health.last_fifo_warn) {
+    // The FIFO legitimately sits empty until the first over. Also allow
+    // 20 ms after MOX starts for the first EP2 samples to reach the radio.
+    // This grace period affects FIFO warnings only, not TX control.
+    let tx_start_grace_elapsed = health
+        .tx_started_at
+        .is_some_and(|started| started.elapsed() >= Duration::from_millis(20));
+
+    if keyed
+        && tx_start_grace_elapsed
+        && c3 & 0x80 != 0
+        && TxHealth::due(&mut health.last_fifo_warn)
+    {
         if c3 & 0x40 == 0 {
             tracing::warn!(
                 "HPSDR P1: the Hermes-Lite's transmit FIFO UNDERRAN — EP2 datagrams are not \
@@ -648,6 +664,7 @@ pub(crate) fn run(ctx: ThreadCtx) {
     // between unkey and the engine draining it.
     let mut tx_backlog = false;
     let mut tx_health = TxHealth::default();
+
     let mut overloads: u64 = 0;
     let mut last_overload_warn: Option<Instant> = None;
     let started = Instant::now();
@@ -728,6 +745,36 @@ pub(crate) fn run(ctx: ThreadCtx) {
                     } else {
                         tracing::warn!(
                             "HPSDR P1: AH-4 start rejected; transmitter active"
+                        );
+                    }
+                }
+                Ctrl::TunerBypass => {
+                    if !regs.ptt {
+                        if let Some(board) = io_board.as_mut() {
+                            if !board.tuner_bypass() {
+                                tracing::warn!(
+                                    "HPSDR P1: AH-4 bypass rejected; tuner not ready"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "HPSDR P1: AH-4 bypass rejected; transmitter active"
+                        );
+                    }
+                }
+                Ctrl::TunerRecover => {
+                    if !regs.ptt {
+                        if let Some(board) = io_board.as_mut() {
+                            if !board.tuner_recover() {
+                                tracing::warn!(
+                                    "HPSDR P1: AH-4 recovery rejected; tuner not ready"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "HPSDR P1: AH-4 recovery rejected; transmitter active"
                         );
                     }
                 }
@@ -1003,6 +1050,7 @@ pub(crate) fn run(ctx: ThreadCtx) {
                 }
             }
             let mox = if regs.ptt { 1 } else { 0 };
+
             // An accessory board on the I2C tunnel gets frame #2 when it has
             // something to say, which is only when the transmit frequency
             // moves; the register rotation keeps the slot the rest of the time
@@ -1312,12 +1360,25 @@ mod tests {
         assert!(health.last_inhibit_warn.is_some(), "inhibit line pulled low");
 
         // FIFO under/overflow only counts while keyed — the transmit FIFO
-        // legitimately sits empty until the first over.
+        // legitimately sits empty until the first over. The startup grace
+        // period prevents an initial empty-FIFO indication being reported.
         let mut health = TxHealth::default();
         hl2_status(0x1E, 0x80, false, &mut health);
         assert!(health.last_fifo_warn.is_none(), "an idle radio has an empty TX FIFO");
+
         hl2_status(0x1E, 0x80, true, &mut health);
-        assert!(health.last_fifo_warn.is_some(), "underflow while keyed");
+        assert!(
+            health.last_fifo_warn.is_none(),
+            "FIFO warning suppressed during TX startup grace period"
+        );
+
+        // Simulate a TX interval that began more than 20 ms ago.
+        health.tx_started_at = Some(Instant::now() - Duration::from_millis(25));
+        hl2_status(0x1E, 0x80, true, &mut health);
+        assert!(
+            health.last_fifo_warn.is_some(),
+            "underflow reported after startup grace period"
+        );
 
         // A plain fill level (bit 15 clear) is not a fault however full it is.
         let mut health = TxHealth::default();
@@ -1331,6 +1392,10 @@ mod tests {
         let first = health.last_inhibit_warn;
         hl2_status(0x1C, 0xC0, true, &mut health);
         assert_eq!(health.last_inhibit_warn, first, "second inhibit warning suppressed");
+
+        // Simulate an established TX interval, beyond the startup grace period.
+        health.tx_started_at = Some(Instant::now() - Duration::from_millis(25));
+        hl2_status(0x1C, 0xC0, true, &mut health);
         assert!(health.last_fifo_warn.is_some(), "overflow still reported");
     }
 

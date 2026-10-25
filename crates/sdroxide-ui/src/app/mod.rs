@@ -165,6 +165,8 @@ pub struct SdroxideApp {
     tuner_status: Option<u8>,
     /// Frame time when the latest available tuner status arrived.
     tuner_status_at: Option<f64>,
+    /// Whether an AH-4 tune, bypass, or recovery operation is in progress.
+    ah4_busy: bool,
     /// A newer release published on sdroxide.com — the version string
     /// itself. Set at most once, when the startup check lands; drawn in the
     /// notice banner's clothes above the panadapter, with a Dismiss that also
@@ -1335,6 +1337,7 @@ impl SdroxideApp {
             radio_notice: None,
             tuner_status: None,
             tuner_status_at: None,
+            ah4_busy: false,
             sent_cfg: None,
             desired_cfg: None,
             desired_at: 0.0,

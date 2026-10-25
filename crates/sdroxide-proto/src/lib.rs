@@ -1546,7 +1546,7 @@ use sdroxide_types::{
 /// ([`sdroxide_types::RotatorProtocol`], a unit enum) on its tail — rotctld or
 /// PSTRotator's UDP control (issue #638). It rides `Command::SetRotatorConfig`
 /// and `StationConfig::rotator` whole, so a v178 peer reads it out of step.
-pub const PROTO_VERSION: u16 = 179;
+pub const PROTO_VERSION: u16 = 180;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -2008,6 +2008,8 @@ pub enum ServerMsg {
     /// `RadioEvent::TunerStatus`: latest verified AH-4 tuner status.
     /// Appended last, for the usual reason.
     TunerStatus(Option<u8>),
+    /// `RadioEvent::Ah4Busy`: whether an AH-4 operation is in progress.
+    Ah4Busy(bool),
 }
 
 /// One radio in a station's roster, as a client sees it.

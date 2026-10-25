@@ -464,6 +464,12 @@ pub(crate) enum Ctrl {
     /// Request AH-4 tuning through the HL2 I/O board.
     /// Does not enable MOX or transmit RF.
     TunerStart,
+    /// Request AH-4 bypass through the HL2 I/O board.
+    /// Does not enable MOX or transmit RF.
+    TunerBypass,
+    /// Request recovery of a faulted AH-4 tuner via the HL2 I/O board.
+    /// Does not enable MOX or transmit RF.
+    TunerRecover,
     Shutdown,
 }
 
@@ -1292,19 +1298,84 @@ impl HpsdrRx {
     }
 
     /// Begin transmitting at `tx_freq_hz`; returns the TX I/Q rate to feed
-    /// [`Self::tx_write`]. The transmitter is DDC 0's — a no-op on any other
-    /// stream, which the engine never asks anyway (their capabilities carry no
-    /// TX).
-    pub fn tx_begin(&self, tx_freq_hz: f64) -> f64 {
-        if self.tx.is_some() {
-            tracing::info!(
-                "HPSDR: TX begin at {tx_freq_hz:.0} Hz ({:.0} Hz I/Q)",
-                self.dev.tx_rate_hz
-            );
-            self.dev.transmitting.store(true, Ordering::Relaxed);
-            let _ = self.dev.ctrl.send(Ctrl::TxOn(tx_freq_hz));
+    /// [`Self::tx_write`].
+    pub fn tx_begin(&self, tx_freq_hz: f64) -> Result<f64, HpsdrError> {
+        if self.tx.is_none() {
+            return Err(HpsdrError::Msg(
+                "cannot begin TX: this HPSDR stream has no transmitter".into(),
+            ));
         }
-        self.dev.tx_rate_hz
+
+        tracing::info!(
+            "HPSDR: TX begin at {tx_freq_hz:.0} Hz ({:.0} Hz I/Q)",
+            self.dev.tx_rate_hz
+        );
+
+        self.dev
+            .ctrl
+            .send(Ctrl::TxOn(tx_freq_hz))
+            .map_err(|e| HpsdrError::Msg(format!("cannot queue TX-on command: {e}")))?;
+
+        self.dev.transmitting.store(true, Ordering::Relaxed);
+        Ok(self.dev.tx_rate_hz)
+    }
+
+    /// Request an AH-4 tuning cycle without keying the transmitter.
+    pub fn tuner_start(&self) -> Result<(), HpsdrError> {
+        if self.tx.is_none() {
+            return Err(HpsdrError::Msg(
+                "cannot start AH-4: this HPSDR stream has no transmitter".into(),
+            ));
+        }
+
+        self.dev
+            .ctrl
+            .send(Ctrl::TunerStart)
+            .map_err(|e| HpsdrError::Msg(format!("cannot queue AH-4 start command: {e}")))
+    }
+
+    /// Request AH-4 bypass without keying the transmitter.
+    pub fn tuner_bypass(&self) -> Result<(), HpsdrError> {
+        if self.tx.is_none() {
+            return Err(HpsdrError::Msg(
+                "cannot bypass AH-4: this HPSDR stream has no transmitter".into(),
+            ));
+        }
+
+        self.dev
+            .ctrl
+            .send(Ctrl::TunerBypass)
+            .map_err(|e| HpsdrError::Msg(format!("cannot queue AH-4 bypass command: {e}")))
+    }
+
+    /// Request AH-4 tuner recovery without enabling transmit RF.
+    pub fn tuner_recover(&self) -> Result<(), HpsdrError> {
+        if self.tx.is_none() {
+            return Err(HpsdrError::Msg(
+                "cannot recover AH-4: this HPSDR stream has no transmitter".into(),
+            ));
+        }
+
+        self.dev
+            .ctrl
+            .send(Ctrl::TunerRecover)
+            .map_err(|e| HpsdrError::Msg(format!("cannot queue AH-4 recovery command: {e}")))
+    }
+
+    /// Stop transmitting.
+    pub fn tx_end(&self) -> Result<(), HpsdrError> {
+        self.dev.transmitting.store(false, Ordering::Relaxed);
+
+        if self.tx.is_none() {
+            return Ok(());
+        }
+
+        tracing::info!("HPSDR: TX end");
+
+        self.dev
+            .ctrl
+            .send(Ctrl::TxOff)
+            .map_err(|e| HpsdrError::Msg(format!("cannot queue TX-off command: {e}")))
     }
 
     /// The state of the radio's own PTT line — a foot switch, a mic button, or
@@ -1335,29 +1406,26 @@ impl HpsdrRx {
             centi => Some(centi as f32 / 100.0),
         }
     }
-    /// Latest AH-4 tuner status, but only while its acknowledgement is fresh.
-    pub fn tuner_status(&self) -> Option<u8> {
+
+    /// Latest AH-4 tuner status and its publication timestamp.
+    ///
+    /// The status is returned only while fresh and the connection is alive.
+    /// The timestamp is retained even when the status is stale or unavailable,
+    /// so callers can establish a baseline for a subsequent status reading.
+    pub fn tuner_status_snapshot(&self) -> (Option<u8>, u64) {
         let published = self.dev.tuner_status.load(Ordering::Acquire);
-        decode_tuner_status(
+        let published_at_us = published >> 9;
+        let status = decode_tuner_status(
             published,
             self.is_alive(),
             self.dev.opened_at.elapsed().as_micros() as u64,
-        )
+        );
+        (status, published_at_us)
     }
-    /// Request an AH-4 tuning cycle without keying the transmitter.
-    /// The Protocol 1 thread verifies tuner availability.
-    pub fn tuner_start(&self) {
-        if self.tx.is_some() {
-            let _ = self.dev.ctrl.send(Ctrl::TunerStart);
-        }
-    }
-    /// Stop transmitting.
-    pub fn tx_end(&self) {
-        if self.tx.is_some() {
-            tracing::info!("HPSDR: TX end");
-            self.dev.transmitting.store(false, Ordering::Relaxed);
-            let _ = self.dev.ctrl.send(Ctrl::TxOff);
-        }
+
+    /// Latest AH-4 tuner status, but only while its acknowledgement is fresh.
+    pub fn tuner_status(&self) -> Option<u8> {
+        self.tuner_status_snapshot().0
     }
 
     /// Push interleaved I,Q TX samples (at the device's TX rate). Blocks

@@ -1146,4 +1146,10 @@ pub enum Command {
     ResetModeDefaults {
         mode: Option<Mode>,
     },
+    /// Request an AH-4 antenna-tuner cycle. This is distinct from
+    /// ordinary carrier TUNE: the engine must wait for tuner permission
+    /// before enabling RF.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    Ah4Tune,
 }

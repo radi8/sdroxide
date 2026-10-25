@@ -1243,6 +1243,9 @@ impl SdroxideApp {
                 // throwing it away on a QSY would blank the wideband strip and
                 // re-read every image store for nothing.
                 RadioEvent::CapabilitiesUpdated(c) => self.caps = Some(c),
+                RadioEvent::Ah4Busy(busy) => {
+                    self.ah4_busy = busy;
+                }
                 RadioEvent::State(s) => {
                     let prev_vfo = self.state.active_freq_hz();
                     let prev_rate = self.state.sample_rate;

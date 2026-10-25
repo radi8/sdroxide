@@ -392,7 +392,9 @@ pub enum RadioEvent {
     /// Latest verified AH-4 tuner status; None means unavailable.
     /// Appended last, for the usual reason.
     TunerStatus(Option<u8>),
-}
+    /// Whether an AH-4 tune, bypass, or recovery operation is in progress.
+    Ah4Busy(bool),
+    }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).
 /// `selected_*` of `None` means "system default".

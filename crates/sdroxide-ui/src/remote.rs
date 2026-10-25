@@ -415,6 +415,9 @@ impl RemoteController {
             ServerMsg::TunerStatus(s) => {
                 self.pending.push_back(RadioEvent::TunerStatus(s))
             }
+            ServerMsg::Ah4Busy(busy) => {
+                self.pending.push_back(RadioEvent::Ah4Busy(busy))
+            }
             ServerMsg::Ft8Status(s) => self.pending.push_back(RadioEvent::Ft8Status(s)),
             ServerMsg::Ft8QsoLogged(r) => self.pending.push_back(RadioEvent::Ft8QsoLogged(r)),
             ServerMsg::SkimmerSpots(s) => self.pending.push_back(RadioEvent::SkimmerSpots(s)),
