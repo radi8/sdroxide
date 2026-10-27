@@ -217,13 +217,6 @@ struct ReadoutFit {
     gaps: f32,
 }
 
-// TEMPORARY: force AH-4 presence in normal builds until Pico probing is ready.
-#[cfg(not(test))]
-const AH4_FORCE_PRESENT_FOR_TESTS: bool = true;
-
-// Keep UI unit tests able to exercise the normal absent-tuner path.
-#[cfg(test)]
-const AH4_FORCE_PRESENT_FOR_TESTS: bool = false;
 
 impl ReadoutFit {
     /// Everything up to the group separators scales with the digit size, and
@@ -1317,7 +1310,7 @@ impl SdroxideApp {
             // PTT is on the strip already; TUNE rides with the levels it is
             // set up with.
             self.tx_controls(ui, cmds, true);
-            let ah4_detected = self.tuner_status.is_some() || AH4_FORCE_PRESENT_FOR_TESTS;
+            let ah4_detected = self.tuner_presence == Some(true);
             let (tune_fill, tune_ink) = if self.ah4_busy {
                 (egui::Color32::GRAY, egui::Color32::LIGHT_GRAY)
             } else if ah4_detected {
@@ -4423,26 +4416,12 @@ impl SdroxideApp {
     }
 
     /// The TUNE latching chip: keys a carrier at the tune level drawn beside
-    /// it. A tuner status temporarily replaces the label for three seconds.
+    /// it. Tuner status is reported in the status bar.
     fn tx_tune_chip(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let tx = self.state.tx;
-        let now = ui.input(|i| i.time);
-        let label = match (self.tuner_status, self.tuner_status_at) {
-            (Some(status), Some(shown_at)) => {
-                let elapsed = now - shown_at;
-                if (0.0..3.0).contains(&elapsed) {
-                    ui.ctx().request_repaint_after(
-                        std::time::Duration::from_secs_f64(3.0 - elapsed),
-                    );
-                    format!(" {status:02X} ")
-                } else {
-                    " TUNE ".to_string()
-                }
-            }
-            _ => " TUNE ".to_string(),
-        };
+        let label = " TUNE ";
 
-        let ah4_detected = self.tuner_status.is_some() || AH4_FORCE_PRESENT_FOR_TESTS;
+        let ah4_detected = self.tuner_presence == Some(true);
 
         let (tune_fill, tune_ink) = if self.ah4_busy {
             (egui::Color32::GRAY, egui::Color32::LIGHT_GRAY)

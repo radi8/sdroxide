@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -676,6 +676,8 @@ pub(crate) struct ThreadCtx {
     pub tx: Consumer<f32>,
     pub ctrl: Receiver<Ctrl>,
     pub tuner_status: Arc<AtomicU64>,
+    /// 0 = discovery pending, 1 = absent, 2 = present. Independent of status freshness.
+    pub tuner_presence: Arc<AtomicU8>,
 }
 
 /// What [`ThreadCtx::temp_centi_c`] holds before a board has reported a
@@ -779,6 +781,8 @@ struct DevInner {
     rev_power_raw: Arc<AtomicU16>,
     /// Latest verified AH-4 tuner status; 0x100 means unavailable.
     tuner_status: Arc<AtomicU64>,
+    /// Latched discovery result: 0 = pending, 1 = absent, 2 = present.
+    tuner_presence: Arc<AtomicU8>,
     /// The TX ring's feed end, claimable exactly once — by DDC 0's stream.
     tx_endpoint: Mutex<Option<Producer<f32>>>,
     /// Which DDCs have a live [`HpsdrRx`], so one cannot be vended twice: two
@@ -822,6 +826,7 @@ impl HpsdrBoard {
         auto_gain: AutoGain,
     ) -> Result<HpsdrBoard, HpsdrError> {
         let tuner_status = Arc::new(AtomicU64::new(0x100));
+        let tuner_presence = Arc::new(AtomicU8::new(0));
         tracing::info!("HPSDR: opening {ip}, requested RX rate {sample_rate_hz:.0} Hz");
         let (board, protocol) = match discovery::probe(ip, Duration::from_millis(800)) {
             Some(dev) => {
@@ -947,6 +952,7 @@ impl HpsdrBoard {
         }
         let ctx = ThreadCtx {
             tuner_status: Arc::clone(&tuner_status),
+            tuner_presence: Arc::clone(&tuner_presence),
             socket,
             radio: IpAddr::V4(ip),
             opened_at,
@@ -1003,6 +1009,7 @@ impl HpsdrBoard {
                 fwd_power_raw,
                 rev_power_raw,
                 tuner_status,
+                tuner_presence,
                 tx_endpoint: Mutex::new(Some(tx_prod)),
                 attached: Mutex::new(std::collections::HashSet::new()),
             }),
@@ -1426,6 +1433,19 @@ impl HpsdrRx {
     /// Latest AH-4 tuner status, but only while its acknowledgement is fresh.
     pub fn tuner_status(&self) -> Option<u8> {
         self.tuner_status_snapshot().0
+    }
+
+    /// Latched AH-4 discovery result, independent of status freshness.
+    /// A dead connection is unknown rather than a confirmed absence.
+    pub fn tuner_presence(&self) -> Option<bool> {
+        if !self.is_alive() {
+            return None;
+        }
+        match self.dev.tuner_presence.load(Ordering::Acquire) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
     }
 
     /// Push interleaved I,Q TX samples (at the device's TX rate). Blocks

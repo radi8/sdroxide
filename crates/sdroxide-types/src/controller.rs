@@ -394,6 +394,9 @@ pub enum RadioEvent {
     TunerStatus(Option<u8>),
     /// Whether an AH-4 tune, bypass, or recovery operation is in progress.
     Ah4Busy(bool),
+    /// Latched AH-4 discovery result; None means not yet determined.
+    /// Appended last, for the usual reason.
+    TunerPresence(Option<bool>),
     }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

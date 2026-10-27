@@ -2478,6 +2478,8 @@ struct Engine {
     ah4_started_at: Option<Instant>,
     /// Latest tuner status reported by the source; None means unavailable.
     ah4_status: Option<u8>,
+    /// Latched discovery result, independent of status freshness.
+    ah4_presence: Option<bool>,
     /// The loudest the microphone got this over, and how many blocks of it were
     /// modulated — see [`Engine::report_silent_microphone`].
     voice_peak: f32,
@@ -4115,6 +4117,7 @@ fn engine_thread(
         ah4_saw_rf_request: false,
         ah4_started_at: None,
         ah4_status: None,
+        ah4_presence: None,
         voice_peak: 0.0,
         voice_blocks: 0,
         hw_ptt: false,
@@ -6125,6 +6128,10 @@ impl Engine {
                 }
             }
             ControlUpdate::Ptt(closed) => self.apply_hw_ptt(closed),
+            ControlUpdate::TunerPresence(presence) => {
+                self.ah4_presence = presence;
+                let _ = self.event_tx.send(RadioEvent::TunerPresence(presence));
+            }
             ControlUpdate::TunerStatus(status) => {
                 self.ah4_status = status;
 
@@ -6245,7 +6252,12 @@ impl Engine {
                         None => {
                             self.ah4_bypass_pending = false;
                             self.ah4_started_at = None;
-                            self.notice("AH-4 bypass failed: tuner status unavailable");
+                            // Confirmed absence is reported by the presence event
+                            // in the UI. Preserve the unavailable-status warning
+                            // when discovery has not established absence.
+                            if self.ah4_presence == Some(true) {
+                                self.notice("AH-4 bypass failed: tuner status unavailable");
+                            }
                         }
                         // Intermediate statuses are not confirmation.
                         Some(_) => {}
@@ -15457,6 +15469,7 @@ impl Engine {
         // AH-4 permission must never carry across a radio-source change.
         self.cancel_ah4_tuning();
         self.ah4_status = None;
+        self.ah4_presence = None;
         // Never carry a keyed transmit across the swap.
         if self.tx_active {
             let _ = self.source.tx_end();
@@ -16105,6 +16118,11 @@ impl Engine {
 
         if !self.source.supports_ah4_tuner() {
             self.notice("The selected radio source does not support AH-4 tuning");
+            return;
+        }
+
+        if self.ah4_presence != Some(true) {
+            self.notice("Auto tuner has not been positively detected");
             return;
         }
 

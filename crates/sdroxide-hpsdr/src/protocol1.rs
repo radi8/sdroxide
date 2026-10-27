@@ -537,6 +537,7 @@ fn stop_stream(socket: &UdpSocket, dest: SocketAddr, radio: IpAddr, conn_id: u64
 pub(crate) fn run(ctx: ThreadCtx) {
     let ThreadCtx {
         tuner_status,
+        tuner_presence,
         socket,
         radio,
         opened_at,
@@ -1056,10 +1057,18 @@ pub(crate) fn run(ctx: ThreadCtx) {
             // moves; the register rotation keeps the slot the rest of the time
             // and never loses its turn (`rot.take` is not reached here).
             let (io_tx, io_rx) = regs.io_board_freqs();
-            let cc = io_board
-                .as_mut()
-                .and_then(|b| b.next_request(now, io_tx, io_rx, mox))
-                .unwrap_or_else(|| regs.cc(rot.take(&regs)));
+            let cc = if let Some(board) = io_board.as_mut() {
+                let request = board.next_request(now, io_tx, io_rx, mox);
+                let presence_code = match board.tuner_presence() {
+                    None => 0,
+                    Some(false) => 1,
+                    Some(true) => 2,
+                };
+                tuner_presence.store(presence_code, Ordering::Release);
+                request.unwrap_or_else(|| regs.cc(rot.take(&regs)))
+            } else {
+                regs.cc(rot.take(&regs))
+            };
             let d = build_ep2(&mut out_seq, speed, mox, regs.oc(), cc, &tx_scratch);
             let _ = socket.send_to(&d, dest);
             next_ep2 += EP2_INTERVAL;

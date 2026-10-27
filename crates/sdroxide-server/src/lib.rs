@@ -276,6 +276,8 @@ pub(crate) struct Latest {
     pub profiles: Vec<String>,
     /// Latest verified AH-4 tuner status; None means unavailable.
     pub tuner_status: Option<u8>,
+    /// Latched AH-4 discovery result; None means not yet determined.
+    pub tuner_presence: Option<bool>,
     /// Whether an AH-4 operation is currently in progress.
     pub ah4_busy: bool,
 }
@@ -1253,6 +1255,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::TunerStatus(status) => {
                 latest.tuner_status = status;
                 Some(ServerMsg::TunerStatus(status))
+            }
+            RadioEvent::TunerPresence(presence) => {
+                latest.tuner_presence = presence;
+                Some(ServerMsg::TunerPresence(presence))
             }
             RadioEvent::Ah4Busy(busy) => {
                 latest.ah4_busy = busy;

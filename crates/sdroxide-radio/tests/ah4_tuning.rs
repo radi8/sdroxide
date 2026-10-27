@@ -155,6 +155,60 @@ fn ah4_tune_waits_for_fresh_rf_request_before_keying() {
     let mut engine = start_engine(Box::new(source), caps(), cfg);
     let thread = engine.thread.take();
 
+    // With tuner presence still unknown, AH-4 tuning must be refused.
+    engine.cmd_tx.send(Command::Ah4Tune).unwrap();
+
+    wait_until("presence guard notice", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::Notice(Some(message))
+                if message.contains("not been positively detected")),
+        )
+    });
+    assert_eq!(
+        tuner_starts.load(Ordering::SeqCst),
+        0,
+        "AH-4 tuning must not start when tuner presence is unknown"
+    );
+
+    // A confirmed absence must also prevent AH-4 tuning.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(false)));
+
+    wait_until("tuner absence event", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::TunerPresence(Some(false))),
+        )
+    });
+
+    engine.cmd_tx.send(Command::Ah4Tune).unwrap();
+
+    wait_until("absence guard notice", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::Notice(Some(message))
+                if message.contains("not been positively detected")),
+        )
+    });
+
+    assert_eq!(
+        tuner_starts.load(Ordering::SeqCst),
+        0,
+        "AH-4 tuning must not start when the tuner is absent"
+    );
+
+    // Establish positive tuner detection before testing AH-4 operation.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(true)));
+
+    wait_until("positive tuner presence", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::TunerPresence(Some(true))),
+        )
+    });
+
     // Establish a known idle tuner state before requesting a tune.
     updates
         .lock()
@@ -325,6 +379,19 @@ fn ah4_tuning_unkeys_when_status_loses_freshness() {
     let mut engine = start_engine(Box::new(source), caps(), cfg);
     let thread = engine.thread.take();
 
+    // Establish positive tuner detection before testing AH-4 operation.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(true)));
+
+    wait_until("positive tuner presence", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::TunerPresence(Some(true))),
+        )
+    });
+
+    // Establish a known idle tuner state before requesting a tune.
     updates
         .lock()
         .unwrap()
@@ -401,6 +468,19 @@ fn ah4_failure_status_does_not_key_transmitter() {
     let mut engine = start_engine(Box::new(source), caps(), cfg);
     let thread = engine.thread.take();
 
+    // Establish positive tuner detection before testing AH-4 operation.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(true)));
+
+    wait_until("positive tuner presence", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::TunerPresence(Some(true))),
+        )
+    });
+
+    // Establish a known idle tuner state before requesting a tune.
     updates
         .lock()
         .unwrap()
@@ -474,6 +554,19 @@ fn ah4_timeout_without_rf_request_never_keys_transmitter() {
     let mut engine = start_engine(Box::new(source), caps(), cfg);
     let thread = engine.thread.take();
 
+    // Establish positive tuner detection before testing AH-4 operation.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(true)));
+
+    wait_until("positive tuner presence", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::TunerPresence(Some(true))),
+        )
+    });
+
+    // Establish a known idle tuner state before requesting a tune.
     updates
         .lock()
         .unwrap()
@@ -551,6 +644,19 @@ fn ah4_cancel_prevents_late_rf_authorization() {
     let mut engine = start_engine(Box::new(source), caps(), cfg);
     let thread = engine.thread.take();
 
+    // Establish positive tuner detection before testing AH-4 operation.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(true)));
+
+    wait_until("positive tuner presence", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::TunerPresence(Some(true))),
+        )
+    });
+
+    // Establish a known idle tuner state before requesting a tune.
     updates
         .lock()
         .unwrap()
@@ -627,13 +733,25 @@ fn ah4_fault_after_tune_routes_next_request_to_recovery() {
     let mut engine = start_engine(Box::new(source), caps(), cfg);
     let thread = engine.thread.take();
 
-    // Establish idle status before requesting a tune.
+    // Establish positive tuner detection before testing AH-4 operation.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(true)));
+
+    wait_until("positive tuner presence", Duration::from_secs(2), || {
+        engine.event_rx.try_iter().any(
+            |event| matches!(event, RadioEvent::TunerPresence(Some(true))),
+        )
+    });
+
+    // Establish a known idle tuner state before requesting a tune.
     updates
         .lock()
         .unwrap()
         .push_back(ControlUpdate::TunerStatus(Some(0x00)));
 
-    wait_until("initial idle status", Duration::from_secs(2), || {
+    wait_until("initial idle tuner status", Duration::from_secs(2), || {
         engine.event_rx.try_iter().any(
             |event| matches!(event, RadioEvent::TunerStatus(Some(0x00))),
         )
@@ -927,7 +1045,12 @@ fn ah4_recovery_stays_busy_when_status_is_unavailable() {
     assert_eq!(tuner_bypasses.load(Ordering::SeqCst), 0);
     assert!(!keyed.load(Ordering::SeqCst));
 
-    // Simulate a temporarily unavailable status while recovery is pending.
+    // Presence is a separate discovery result and must survive a temporary
+    // loss of status while recovery is pending.
+    updates
+        .lock()
+        .unwrap()
+        .push_back(ControlUpdate::TunerPresence(Some(true)));
     updates
         .lock()
         .unwrap()
@@ -936,6 +1059,7 @@ fn ah4_recovery_stays_busy_when_status_is_unavailable() {
     let mut busy = false;
     let mut saw_busy = false;
     let mut saw_unavailable = false;
+    let mut saw_presence = false;
 
     wait_until(
         "unavailable status while recovery is busy",
@@ -950,11 +1074,14 @@ fn ah4_recovery_stays_busy_when_status_is_unavailable() {
                     RadioEvent::TunerStatus(None) => {
                         saw_unavailable = true;
                     }
+                    RadioEvent::TunerPresence(Some(true)) => {
+                        saw_presence = true;
+                    }
                     _ => {}
                 }
             }
 
-            saw_busy && saw_unavailable
+            saw_busy && saw_unavailable && saw_presence
         },
     );
 

@@ -1345,7 +1345,19 @@ impl SdroxideApp {
                 }
                 RadioEvent::TunerStatus(status) => {
                     self.tuner_status = status;
-                    self.tuner_status_at = status.map(|_| now);
+                }
+                RadioEvent::TunerPresence(presence) => {
+                    self.tuner_presence = presence;
+                    match presence {
+                        Some(false) => {
+                            self.radio_notice = Some("Tuner not detected".into());
+                        }
+                        None | Some(true) => {
+                            if self.radio_notice.as_deref() == Some("Tuner not detected") {
+                                self.radio_notice = None;
+                            }
+                        }
+                    }
                 }
                 RadioEvent::Notice(n) => {
                     if self.focused {

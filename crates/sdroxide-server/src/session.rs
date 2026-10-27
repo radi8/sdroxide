@@ -191,6 +191,7 @@ async fn run_session(
         relay,
         profiles,
         tuner_status,
+        tuner_presence,
         ah4_busy,
     ) = {
         let latest = shared.latest.lock().unwrap();
@@ -219,6 +220,7 @@ async fn run_session(
             latest.relay.clone(),
             latest.profiles.clone(),
             latest.tuner_status,
+            latest.tuner_presence,
             latest.ah4_busy,
         )
     };
@@ -242,6 +244,7 @@ async fn run_session(
     let _ = socket.send(msg(&ServerMsg::Scanner(scanner))).await;
     let _ = socket.send(msg(&ServerMsg::Profiles(profiles))).await;
     let _ = socket.send(msg(&ServerMsg::TunerStatus(tuner_status))).await;
+    let _ = socket.send(msg(&ServerMsg::TunerPresence(tuner_presence))).await;
     let _ = socket.send(msg(&ServerMsg::Ah4Busy(ah4_busy))).await;
     // The operator config, which the engine announced once at startup. Without
     // this replay the client's callsign and grid come up empty and greyed out.

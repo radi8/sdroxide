@@ -112,6 +112,8 @@ pub enum ControlUpdate {
     RigTx(bool),
     /// Latest verified AH-4 tuner status. None means unavailable.
     TunerStatus(Option<u8>),
+    /// Latched AH-4 discovery result; None means not yet determined.
+    TunerPresence(Option<bool>),
 }
 
 /// Anything that produces a stream of complex baseband samples: a live

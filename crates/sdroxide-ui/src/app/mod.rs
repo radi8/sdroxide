@@ -163,8 +163,8 @@ pub struct SdroxideApp {
     radio_notice: Option<String>,
     /// Latest verified AH-4 tuner status; None means unavailable.
     tuner_status: Option<u8>,
-    /// Frame time when the latest available tuner status arrived.
-    tuner_status_at: Option<f64>,
+    /// Latched AH-4 discovery result; None means not yet determined.
+    tuner_presence: Option<bool>,
     /// Whether an AH-4 tune, bypass, or recovery operation is in progress.
     ah4_busy: bool,
     /// A newer release published on sdroxide.com — the version string
@@ -1336,7 +1336,7 @@ impl SdroxideApp {
             retry_backoff: RETRY_MIN_S,
             radio_notice: None,
             tuner_status: None,
-            tuner_status_at: None,
+            tuner_presence: None,
             ah4_busy: false,
             sent_cfg: None,
             desired_cfg: None,

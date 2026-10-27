@@ -65,6 +65,8 @@ pub struct HpsdrSource {
     label: String,
     /// Last AH-4 tuner status reported through poll_control().
     last_tuner_status: Option<Option<u8>>,
+    /// Last latched discovery outcome; None is not positive detection.
+    last_tuner_presence: Option<Option<bool>>,
     /// Timestamp baseline for confirmation of an accepted AH-4 command.
     tuner_status_after_us: Option<u64>,
     /// See [`sdroxide_types::HpsdrConfig::tx_latency_ms`].
@@ -347,6 +349,7 @@ impl HpsdrSource {
             ps_warned_offset: false,
             io_rx_input,
             last_tuner_status: None,
+            last_tuner_presence: None,
             tuner_status_after_us: None,
         })
     }
@@ -647,6 +650,12 @@ impl IqSource for HpsdrSource {
         if ptt != self.ptt {
             self.ptt = ptt;
             updates.push(ControlUpdate::Ptt(ptt));
+        }
+
+        let presence = self.rx.as_ref().and_then(|rx| rx.tuner_presence());
+        if self.last_tuner_presence != Some(presence) {
+            self.last_tuner_presence = Some(presence);
+            updates.push(ControlUpdate::TunerPresence(presence));
         }
 
         let tuner_snapshot = self

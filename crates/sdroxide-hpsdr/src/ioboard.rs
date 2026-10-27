@@ -116,17 +116,10 @@ const PROBE_TRIES: u8 = 3;
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// How often to read the AH-4 tuner status register.
 const TUNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-// TEMPORARY TEST OVERRIDE: assume the AH-4 is physically connected
-// in normal application builds until the Pico presence probe is ready.
-#[cfg(not(test))]
-const AH4_FORCE_PRESENT_FOR_TESTS: bool = true;
-
-// Unit tests must still be able to simulate an absent tuner.
-#[cfg(test)]
-const AH4_FORCE_PRESENT_FOR_TESTS: bool = false;
+// The Pico register-7 KEY handshake determines whether an AH-4 is present.
 /// Maximum age of a successful status read when authorising a tuning start.
 const TUNER_STATUS_MAX_AGE: Duration = Duration::from_millis(200);
-/// Maximum time allowed for the initial bypass test.
+/// Maximum time allowed for AH-4 discovery and bypass-status verification.
 const TUNER_INIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum time allowed for an AH-4 tuning cycle.
 const TUNER_START_TIMEOUT: Duration = Duration::from_secs(4);
@@ -179,11 +172,13 @@ enum Presence {
 enum TunerInit {
     /// Startup frequency updates are not yet complete.
     WaitingForFrequencies,
-    /// Register 7 has been primed with 0xFD.
-    Priming,
-    /// Bypass command 0x02 has been sent.
-    BypassRequested,
-    /// Waiting for the bypass result, 0x00 or 0xFC.
+    /// Discovery command 0x01 is queued after startup frequency writes.
+    DiscoveryRequested,
+    /// Waiting for the terminal KEY-handshake result: 0xFC (present) or 0xFB (absent).
+    Discovering,
+    /// Discovery outcome is latched; request bypass without enabling RF.
+    DiscoveryBypassRequested,
+    /// Waiting for bypass status; this must not alter the discovery outcome.
     VerifyingBypass,
     /// Initialisation has finished; monitor tuner status.
     Monitoring,
@@ -260,7 +255,19 @@ impl IoBoard {
     }
 
     pub(crate) fn tuner_present(&self) -> bool {
-        self.tuner_present || AH4_FORCE_PRESENT_FOR_TESTS
+        self.tuner_present
+    }
+
+    /// Discovery outcome, independent of the freshness of the status byte.
+    /// None means discovery has not reached a result yet; callers must not
+    /// treat it as positive AH-4 detection.
+    pub(crate) fn tuner_presence(&self) -> Option<bool> {
+        match self.tuner_init {
+            TunerInit::WaitingForFrequencies
+            | TunerInit::DiscoveryRequested
+            | TunerInit::Discovering => None,
+            _ => Some(self.tuner_present),
+        }
     }
 
     /// Queue an AH-4 start command only for a verified, idle tuner.
@@ -438,6 +445,24 @@ impl IoBoard {
             self.tuner_fault = true;
         }
 
+        // Enforce the discovery deadline even while an I2C request is outstanding.
+        // Keep the in-flight request tracked; bypass can only be sent when safe.
+        if self.tuner_init == TunerInit::Discovering
+            && self
+                .tuner_verify_started_at
+                .is_some_and(|started| now >= started + TUNER_INIT_TIMEOUT)
+        {
+            self.tuner_present = false;
+            self.tuner_init = TunerInit::DiscoveryBypassRequested;
+            self.tuner_verify_started_at = None;
+            self.queue.clear();
+            self.queue.push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+            tracing::warn!(
+                "HL2IOBoard: AH-4 discovery timed out without a definitive KEY result; \
+                 treating tuner as absent and requesting bypass"
+            );
+        }
+
         // An unanswered request leaves the I2C transaction outcome uncertain.
         // Do not retry or send another request until the bus is recovered.
         if let Some(f) = self.inflight.as_ref() {
@@ -467,6 +492,7 @@ impl IoBoard {
         if op.cookie == I2C_WRITE
             && op.reg == REG_ANTENNA_TUNER
             && op.data == 0x01
+            && self.tuner_start_pending
         {
             self.tuner_start_started_at = Some(now);
             tracing::info!("HL2IOBoard: AH-4 start command sent");
@@ -494,7 +520,8 @@ impl IoBoard {
                 }
             }
             Presence::Present => {
-                // Stop initial bypass verification after the timeout.
+                // Bypass verification is diagnostic only and cannot alter the
+                // presence result latched by the preceding KEY handshake.
                 if self.tuner_init == TunerInit::VerifyingBypass
                     && self
                         .tuner_verify_started_at
@@ -504,8 +531,8 @@ impl IoBoard {
                     self.tuner_verify_started_at = None;
                     self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
                     tracing::warn!(
-                        "HL2IOBoard: tuner bypass verification timed out; \
-                         continuing status monitoring"
+                        "HL2IOBoard: post-discovery bypass verification timed out; \
+                         retaining discovery result and continuing status monitoring"
                     );
                 }
 
@@ -517,7 +544,9 @@ impl IoBoard {
                 if self.sent_at.is_some_and(|t| now < t + FREQ_INTERVAL) {
                     if matches!(
                         self.tuner_init,
-                        TunerInit::VerifyingBypass | TunerInit::Monitoring
+                        TunerInit::Discovering
+                            | TunerInit::VerifyingBypass
+                            | TunerInit::Monitoring
                     ) && self.tuner_poll_at.is_none_or(|t| now >= t)
                     {
                         self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
@@ -564,7 +593,7 @@ impl IoBoard {
                 // Poll the tuner during bypass verification and normal monitoring.
                 if matches!(
                     self.tuner_init,
-                    TunerInit::VerifyingBypass | TunerInit::Monitoring
+                    TunerInit::Discovering | TunerInit::VerifyingBypass | TunerInit::Monitoring
                 ) && self.tuner_poll_at.is_none_or(|t| now >= t)
                 {
                     self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
@@ -646,34 +675,33 @@ impl IoBoard {
             self.startup_writes_pending -= 1;
 
             if self.startup_writes_pending == 0 {
-                self.tuner_init = TunerInit::Priming;
+                self.tuner_init = TunerInit::DiscoveryRequested;
                 tracing::debug!(
-                    "HL2IOBoard: initial frequency writes complete; priming tuner status"
+                    "HL2IOBoard: initial frequency writes complete; starting AH-4 KEY discovery"
                 );
-                self.queue
-                    .push_back(Op::write(REG_ANTENNA_TUNER, 0xFD));
+                self.queue.push_back(Op::write(REG_ANTENNA_TUNER, 0x01));
             }
         }
 
         // Advance the tuner startup sequence only after its writes are acknowledged.
         if f.op.cookie == I2C_WRITE && f.op.reg == REG_ANTENNA_TUNER {
             match (self.tuner_init, f.op.data) {
-                (TunerInit::Priming, 0xFD) => {
-                    self.tuner_init = TunerInit::BypassRequested;
-                    self.queue
-                        .push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+                (TunerInit::DiscoveryRequested, 0x01) => {
+                    self.tuner_init = TunerInit::Discovering;
+                    self.tuner_verify_started_at = Some(now);
+                    self.tuner_poll_at = Some(now);
+                    self.queue.push_back(Op::read(REG_ANTENNA_TUNER));
                     tracing::debug!(
-                        "HL2IOBoard: tuner status primed; requesting bypass"
+                        "HL2IOBoard: discovery command acknowledged; waiting for KEY handshake"
                     );
                 }
-                (TunerInit::BypassRequested, 0x02) => {
+                (TunerInit::DiscoveryBypassRequested, 0x02) => {
                     self.tuner_init = TunerInit::VerifyingBypass;
                     self.tuner_verify_started_at = Some(now);
                     self.tuner_poll_at = Some(now);
-                    self.queue
-                        .push_back(Op::read(REG_ANTENNA_TUNER));
+                    self.queue.push_back(Op::read(REG_ANTENNA_TUNER));
                     tracing::debug!(
-                        "HL2IOBoard: bypass requested; checking tuner status"
+                        "HL2IOBoard: discovery outcome latched; bypass requested and status verification started"
                     );
                 }
                 (TunerInit::Monitoring, 0x02) => {
@@ -734,34 +762,59 @@ impl IoBoard {
             }
 
             match self.tuner_init {
-                TunerInit::VerifyingBypass => {
+                TunerInit::Discovering => {
                     match status {
-                        0x00 => {
+                        0xFC => {
+                            // Only the terminal KEY-handshake result confirms presence.
+                            // Startup discovery must never request RF.
                             self.tuner_present = true;
-                            self.tuner_init = TunerInit::Monitoring;
+                            self.tuner_init = TunerInit::DiscoveryBypassRequested;
                             self.tuner_verify_started_at = None;
-                            self.tuner_poll_at =
-                                Some(now + TUNER_POLL_INTERVAL);
+                            self.queue.clear();
+                            self.queue.push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
                             tracing::info!(
-                                "HL2IOBoard: AH-4 tuner responded; bypass succeeded"
+                                "HL2IOBoard: AH-4 discovery completed (0xFC); requesting bypass without RF"
                             );
                         }
-                        0xFC => {
-                            self.tuner_present = true;
-                            self.tuner_init = TunerInit::Monitoring;
+                        0xFB => {
+                            self.tuner_present = false;
+                            self.tuner_init = TunerInit::DiscoveryBypassRequested;
                             self.tuner_verify_started_at = None;
-                            self.tuner_poll_at =
-                                Some(now + TUNER_POLL_INTERVAL);
-                            tracing::warn!(
-                                "HL2IOBoard: AH-4 tuner responded, but bypass failed"
+                            self.queue.clear();
+                            self.queue.push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+                            tracing::info!(
+                                "HL2IOBoard: AH-4 discovery completed (0xFB); tuner absent; requesting bypass"
                             );
                         }
                         _ => {
-                            // 0xFD means the firmware is still waiting.
-                            // Other values are retained for diagnosis while
-                            // verification continues until its timeout.
-                            self.tuner_poll_at =
-                                Some(now + TUNER_POLL_INTERVAL);
+                            // 0x04, 0xEE and 0x07 are intermediate, not terminal.
+                            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                        }
+                    }
+                }
+                TunerInit::VerifyingBypass => {
+                    match status {
+                        0x00 => {
+                            self.tuner_init = TunerInit::Monitoring;
+                            self.tuner_verify_started_at = None;
+                            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                            tracing::info!(
+                                "Post-discovery bypass status is idle; discovery result retained"
+                            );
+                        }
+                        0xFC => {
+                            self.tuner_init = TunerInit::Monitoring;
+                            self.tuner_verify_started_at = None;
+                            self.tuner_fault = self.tuner_present;
+                            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+                            tracing::warn!(
+                                "Post-discovery bypass status reports failure; discovery result retained"
+                            );
+                        }
+                        _ => {
+                            // The write ACK is not proof of bypass. Wait for a
+                            // definitive status, without inferring presence.
+                            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
                         }
                     }
                 }
@@ -789,11 +842,8 @@ impl IoBoard {
                         }
                     }
 
-                    // A recognised tuner response confirms detection.
-                    if status == 0x00 || status == 0xFC {
-                        self.tuner_present = true;
-                    }
-
+                    // Presence is latched by the startup KEY handshake only.
+                    // Later status reads cannot turn an absent tuner into present.
                     if self.tuner_start_pending {
                         match status {
                             0x00 if self.tuner_start_seen_active => {
@@ -898,6 +948,57 @@ impl IoBoard {
             self.tuner_fault = true;
             tracing::warn!("HL2IOBoard: AH-4 start request failed at the I2C layer");
         }
+        if self.tuner_init == TunerInit::DiscoveryBypassRequested
+            && !(op.cookie == I2C_WRITE
+                && op.reg == REG_ANTENNA_TUNER
+                && op.data == 0x02)
+        {
+            // An explicit I2C error cleared the queued bypass after discovery
+            // timed out. Restore the bypass request; bus quarantine still
+            // prevents sending it if the transaction outcome is uncertain.
+            self.queue.push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+            tracing::warn!(
+                "HL2IOBoard: I2C error during timed-out discovery; restoring the bypass request"
+            );
+        } else if self.tuner_init == TunerInit::DiscoveryRequested
+            && op.cookie == I2C_WRITE
+            && op.reg == REG_ANTENNA_TUNER
+            && op.data == 0x01
+        {
+            self.tuner_present = false;
+            self.tuner_init = TunerInit::DiscoveryBypassRequested;
+            self.tuner_verify_started_at = None;
+            self.queue.push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+            tracing::warn!("HL2IOBoard: discovery command failed at I2C layer; tuner absent; requesting bypass");
+        } else if self.tuner_init == TunerInit::Discovering
+            && op.cookie == I2C_READ
+            && op.reg == REG_ANTENNA_TUNER
+        {
+            self.tuner_present = false;
+            self.tuner_init = TunerInit::DiscoveryBypassRequested;
+            self.tuner_verify_started_at = None;
+            self.queue.push_back(Op::write(REG_ANTENNA_TUNER, 0x02));
+            tracing::warn!("HL2IOBoard: discovery status read failed; tuner absent; requesting bypass");
+        } else if self.tuner_init == TunerInit::DiscoveryBypassRequested
+            && op.cookie == I2C_WRITE
+            && op.reg == REG_ANTENNA_TUNER
+            && op.data == 0x02
+        {
+            // A failed bypass write must not leave startup stuck in this state.
+            // Preserve the discovery result, but invalidate status and block
+            // tuning if a tuner was found and its bypass state is uncertain.
+            self.tuner_status = None;
+            self.tuner_status_at = None;
+            self.tuner_init = TunerInit::Monitoring;
+            self.tuner_verify_started_at = None;
+            self.tuner_poll_at = Some(now + TUNER_POLL_INTERVAL);
+            self.tuner_fault = self.tuner_present;
+            tracing::warn!(
+                "HL2IOBoard: post-discovery bypass write failed at the I2C layer; \
+                 discovery result retained and tuning remains blocked as needed"
+            );
+        }
+
         if self.tuner_init == TunerInit::RecoveryBypassRequested
             && op.cookie == I2C_WRITE
             && op.reg == REG_ANTENNA_TUNER
@@ -993,6 +1094,19 @@ fn freq_writes(hz: u64) -> [Op; 5] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tuner_presence_is_unknown_until_discovery_has_a_result() {
+        let mut board = IoBoard::new(sdroxide_types::HpsdrIoRxInput::Radio);
+        assert_eq!(board.tuner_presence(), None);
+
+        board.tuner_init = TunerInit::DiscoveryBypassRequested;
+        board.tuner_present = false;
+        assert_eq!(board.tuner_presence(), Some(false));
+
+        board.tuner_present = true;
+        assert_eq!(board.tuner_presence(), Some(true));
+    }
+
     /// A receive frequency for the tests that are not about the receive code.
     /// Held fixed so it contributes exactly one write after the reset.
     const RX_HZ: u64 = 14_074_000;
@@ -1010,31 +1124,39 @@ mod tests {
         probe
     }
 
-    fn complete_tuner_priming(board: &mut IoBoard, now: Instant) {
-        // Acknowledge the priming marker.
-        let cc = board
-            .next_request(now, RX_HZ, RX_HZ, 0)
-            .expect("tuner priming request");
-        assert_eq!(cc[3], REG_ANTENNA_TUNER);
-        assert_eq!(cc[4], 0xFD);
+    fn complete_tuner_priming(board: &mut IoBoard, now: Instant) -> Instant {
+        let mut now = now;
+
+        let cc = board.next_request(now, RX_HZ, RX_HZ, 0).expect("intermediate status");
+        assert_eq!((cc[3], cc[4]), (REG_ANTENNA_TUNER, 0x01));
+        ack(board, now, [0; 4]);
+        now += TUNER_POLL_INTERVAL;
+
+        for intermediate in [0x04, 0xEE, 0x07] {
+            let cc = board.next_request(now, RX_HZ, RX_HZ, 0).expect("intermediate status");
+            assert_eq!((cc[1], cc[3]), (I2C_READ, REG_ANTENNA_TUNER));
+            ack(board, now, [0, 0, 0, intermediate]);
+            assert!(!board.tuner_present, "intermediate status must not confirm presence");
+            assert!(!board.tuner_start_pending, "discovery must not request RF");
+            now += TUNER_POLL_INTERVAL;
+        }
+
+        let cc = board.next_request(now, RX_HZ, RX_HZ, 0).expect("terminal discovery status");
+        assert_eq!((cc[1], cc[3]), (I2C_READ, REG_ANTENNA_TUNER));
+        ack(board, now, [0, 0, 0, 0xFC]);
+        assert!(board.tuner_present);
+        assert!(!board.tuner_start_pending, "discovery must not request RF");
+
+        let cc = board.next_request(now, RX_HZ, RX_HZ, 0).expect("bypass request");
+        assert_eq!((cc[3], cc[4]), (REG_ANTENNA_TUNER, 0x02));
         ack(board, now, [0; 4]);
 
-        // Acknowledge the bypass request.
-        let cc = board
-            .next_request(now, RX_HZ, RX_HZ, 0)
-            .expect("tuner bypass request");
-        assert_eq!(cc[3], REG_ANTENNA_TUNER);
-        assert_eq!(cc[4], 0x02);
-        ack(board, now, [0; 4]);
-
-        // Acknowledge the status read.
-        let cc = board
-            .next_request(now, RX_HZ, RX_HZ, 0)
-            .expect("tuner status read");
-        assert_eq!(cc[1], I2C_READ);
-        assert_eq!(cc[2], IOB_ADDR);
-        assert_eq!(cc[3], REG_ANTENNA_TUNER);
-        ack(board, now, [0x00, 0, 0, 0]);
+        let cc = board.next_request(now, RX_HZ, RX_HZ, 0).expect("bypass status");
+        assert_eq!((cc[1], cc[3]), (I2C_READ, REG_ANTENNA_TUNER));
+        ack(board, now, [0, 0, 0, 0x00]);
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+        assert!(board.tuner_present, "bypass status must preserve discovery result");
+        now
     }
 
     /// A present, idle board with a latched tuner fault and an empty bus.
@@ -1469,6 +1591,33 @@ mod tests {
 
 
     #[test]
+    fn discovery_bypass_i2c_error_retains_presence_and_latches_fault() {
+        let mut board = faulted_idle_board();
+        let now = Instant::now();
+        board.tuner_fault = false;
+        board.tuner_init = TunerInit::DiscoveryBypassRequested;
+        board.tuner_present = true;
+        board.tuner_status = Some(0xEE);
+        board.tuner_status_at = Some(now);
+        board.inflight = Some(InFlight {
+            op: Op::write(REG_ANTENNA_TUNER, 0x02),
+            sent_at: now,
+        });
+
+        // Simulate the radio reporting that the Pico did not ACK the bypass write.
+        board.on_ack(RADDR_ERROR, [0; 4], now);
+
+        assert!(board.tuner_present, "bypass failure must not erase discovery");
+        assert!(board.tuner_fault, "uncertain bypass state must block tuning");
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+        assert_eq!(board.tuner_status, None, "pre-failure status must be invalidated");
+        assert_eq!(board.tuner_status_at, None);
+        assert_eq!(board.tuner_verify_started_at, None);
+        assert!(board.inflight.is_none());
+        assert!(!board.tuner_start(), "faulted tuner must not start");
+    }
+
+    #[test]
     fn probe_reads_the_version_register_and_then_resets_the_board() {
         let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
         let now = Instant::now();
@@ -1538,19 +1687,83 @@ mod tests {
             }
         }
 
-        // The initial frequencies are complete. Now acknowledge the
-        // tuner-status priming write.
+        // Discovery starts directly with 0x01 after the initial frequency writes.
         let request = board
             .next_request(now, RX_HZ, RX_HZ, 0)
-            .expect("tuner priming request");
-
-        assert_eq!(request[3], REG_ANTENNA_TUNER);
-        assert_eq!(request[4], 0xFD);
+            .expect("AH-4 discovery request");
+        assert_eq!((request[3], request[4]), (REG_ANTENNA_TUNER, 0x01));
+        assert_eq!(board.tuner_init, TunerInit::DiscoveryRequested);
 
         ack(&mut board, now, [0; 4]);
         now += Duration::from_millis(3);
 
-        assert_eq!(board.tuner_init, TunerInit::BypassRequested);
+        assert_eq!(board.tuner_init, TunerInit::Discovering);
+        assert!(!board.tuner_present, "presence is not assumed before terminal discovery status");
+    }
+
+    #[test]
+    fn ah4_discovery_fb_latches_absence_even_if_bypass_status_is_idle() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let mut now = Instant::now();
+        find(&mut board, now);
+
+        // Reset + five transmit-frequency bytes + receive-frequency code.
+        for _ in 0..7 {
+            board.next_request(now, RX_HZ, RX_HZ, 0).expect("startup write");
+            ack(&mut board, now, [0; 4]);
+            now += Duration::from_millis(3);
+            now += TUNER_POLL_INTERVAL;
+        }
+
+        let discover = board.next_request(now, RX_HZ, RX_HZ, 0).expect("discovery");
+        assert_eq!((discover[3], discover[4]), (REG_ANTENNA_TUNER, 0x01));
+        ack(&mut board, now, [0; 4]);
+        now += TUNER_POLL_INTERVAL;
+
+        for intermediate in [0x04, 0xEE, 0x07] {
+            let read = board.next_request(now, RX_HZ, RX_HZ, 0)
+                .expect("intermediate status");
+            assert_eq!((read[1], read[3]), (I2C_READ, REG_ANTENNA_TUNER));
+            ack(&mut board, now, [0, 0, 0, intermediate]);
+            assert!(!board.tuner_present);
+            assert_eq!(board.tuner_init, TunerInit::Discovering);
+            now += TUNER_POLL_INTERVAL;
+        }
+
+        let read = board.next_request(now, RX_HZ, RX_HZ, 0).expect("terminal discovery status");
+        assert_eq!((read[1], read[3]), (I2C_READ, REG_ANTENNA_TUNER));
+        ack(&mut board, now, [0, 0, 0, 0xFB]);
+        assert!(!board.tuner_present);
+        assert_eq!(board.tuner_init, TunerInit::DiscoveryBypassRequested);
+        assert!(!board.tuner_start_pending);
+
+        let bypass = board.next_request(now, RX_HZ, RX_HZ, 0).expect("final bypass");
+        assert_eq!((bypass[3], bypass[4]), (REG_ANTENNA_TUNER, 0x02));
+        ack(&mut board, now, [0; 4]);
+
+        let status = board.next_request(now, RX_HZ, RX_HZ, 0).expect("bypass verification");
+        assert_eq!((status[1], status[3]), (I2C_READ, REG_ANTENNA_TUNER));
+        ack(&mut board, now, [0, 0, 0, 0x00]);
+        assert_eq!(board.tuner_init, TunerInit::Monitoring);
+        assert!(!board.tuner_present, "idle bypass status must not overwrite 0xFB");
+        assert!(!board.tuner_start(), "an absent tuner must not start");
+    }
+
+    #[test]
+    fn ah4_discovery_host_timeout_latches_absence_and_requests_bypass() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+        board.presence = Presence::Present;
+        board.tuner_init = TunerInit::Discovering;
+        board.tuner_verify_started_at = Some(now);
+        board.tuner_poll_at = None;
+
+        let bypass = board
+            .next_request(now + TUNER_INIT_TIMEOUT, RX_HZ, RX_HZ, 0)
+            .expect("bypass after host discovery timeout");
+        assert_eq!((bypass[3], bypass[4]), (REG_ANTENNA_TUNER, 0x02));
+        assert!(!board.tuner_present);
+        assert_eq!(board.tuner_init, TunerInit::DiscoveryBypassRequested);
     }
 
     /// `REG_RF_INPUTS` is the operator's answer to "what is wired to the board's
@@ -1670,7 +1883,7 @@ mod tests {
         assert_eq!((rx[3], rx[4]), (REG_FCODE_RX1, hertz_to_code(RX_HZ)));
 
         now += Duration::from_millis(3);
-        complete_tuner_priming(&mut board, now);
+        now = complete_tuner_priming(&mut board, now);
 
         // The dial is still, but periodic tuner-status polling continues.
         now += FREQ_INTERVAL * 2;
@@ -1720,7 +1933,7 @@ mod tests {
             ack(&mut board, now, [0; 4]);
         }
         now += Duration::from_millis(3);
-        complete_tuner_priming(&mut board, now);
+        now = complete_tuner_priming(&mut board, now);
         // Tuning around 20 m does not change the transmit frequency or receive
         // code, but periodic tuner-status polling continues.
         for hz in [14_000_000, 14_050_000, 14_100_000, 14_074_000] {
@@ -1767,7 +1980,10 @@ mod tests {
         }
 
         now += Duration::from_millis(3);
-        complete_tuner_priming(&mut board, now);
+        now = complete_tuner_priming(&mut board, now);
+        // Start a fresh rate-limit window so this test isolates
+        // frequency-update rate limiting from discovery timing.
+        board.sent_at = Some(now);
         // A band change inside the rate-limit window is held, not dropped...
         now += Duration::from_millis(50);
         assert_eq!(board.next_request(now, 14_074_000, RX_HZ, 0), None, "too soon");
@@ -1775,6 +1991,7 @@ mod tests {
         // ...and a second change replaces the first. At 100 ms, the
         // periodic tuner-status poll is due, so service it before continuing.
         now += Duration::from_millis(50);
+
         let status = board
             .next_request(now, 21_074_000, RX_HZ, 0)
             .expect("periodic tuner status poll");
