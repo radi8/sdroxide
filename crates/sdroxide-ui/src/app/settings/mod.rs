@@ -18,6 +18,7 @@
 pub(in crate::app) mod controls;
 pub(in crate::app) mod general;
 pub(in crate::app) mod net;
+pub(in crate::app) mod picup;
 pub(in crate::app) mod profiles;
 pub(in crate::app) mod radio;
 pub(in crate::app) mod relay;
@@ -26,8 +27,10 @@ pub(in crate::app) mod remote;
 pub(in crate::app) mod servers;
 pub(in crate::app) mod tle;
 pub(in crate::app) mod ui_tab;
+pub(in crate::app) mod wavelog;
 
 pub(in crate::app) mod alerts;
+pub(in crate::app) mod amp;
 
 use eframe::egui::{self, Color32, ComboBox, RichText};
 use sdroxide_types::{Command, LoginTarget, LookupProvider, NetworkConfig, UploadTarget};
@@ -86,6 +89,8 @@ pub(in crate::app) enum SettingsTab {
     /// sequencer's timings and a test button apiece — and this is the one page
     /// in here whose being hard to find could cost somebody a front end.
     TrSwitch,
+    /// The Hardrock amplifier: its port, model, and whether it follows the band.
+    Amp,
     /// Dial another station. Native only: a browser client is already attached
     /// to the server that served it and has nowhere to put a second one.
     #[cfg(not(target_arch = "wasm32"))]
@@ -282,6 +287,9 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// GridTracker, JTAlert, N1MM+ and Log4OM.
     wsjtx_edit: &'a mut sdroxide_types::WsjtxConfig,
     wsjtx_apply: &'a mut bool,
+    /// Received pictures → FTP: the dialog's copy, and whether to send it.
+    picup_edit: &'a mut sdroxide_types::PictureUploadConfig,
+    picup_apply: &'a mut bool,
     /// The rotctld *client* — the satellite lock steering a motorized antenna.
     rot_edit: &'a mut sdroxide_types::RotatorConfig,
     rot_apply: &'a mut bool,
@@ -289,6 +297,8 @@ pub(in crate::app) struct SettingsIo<'a> {
     relay_apply: &'a mut bool,
     /// Which contact the operator asked to hear, if any.
     relay_test: &'a mut Option<u8>,
+    amp_edit: &'a mut sdroxide_types::AmpConfig,
+    amp_apply: &'a mut bool,
     /// Control-input bindings, plus the row (if any) waiting to capture a
     /// keypress. Persisted on close, since a rebind has no APPLY step.
     input_edit: &'a mut sdroxide_types::InputSettings,
@@ -350,11 +360,9 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// there is no APPLY step on the General tab, and the whole point of it is
     /// that the band plan follows immediately.
     region_edit: &'a mut sdroxide_types::Region,
-    /// The transmit parametric EQ (voice modes only). Same contract as
-    /// `region_edit`: no APPLY step, sent the moment a band changes. This is
-    /// live `RadioState`, not a per-backend `RadioConfig`, so it applies
-    /// regardless of which radio interface is selected.
-    tx_eq_edit: &'a mut sdroxide_types::TxEqState,
+    /// Set when the operator asks for the TX Audio window, which took over
+    /// the transmit EQ that used to sit in this tab.
+    open_tx_audio: &'a mut bool,
     tab: &'a mut SettingsTab,
     /// Which logging service the Uploads tab's own strip is showing. Its own
     /// field rather than state inside the tab's body, because the body is drawn
@@ -684,29 +692,6 @@ fn drive_trim_table(ui: &mut egui::Ui, cfg: &mut sdroxide_types::RadioConfig) {
             .weak(),
         );
     });
-}
-
-/// One row of the transmit-EQ grid: a band's frequency, gain and Q/slope.
-/// `q_range` doubles as the shelf-slope range for the two shelf bands, see
-/// [`sdroxide_types::TxEqBand::q`].
-fn tx_eq_band_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    band: &mut sdroxide_types::TxEqBand,
-    freq_range: std::ops::RangeInclusive<f32>,
-    q_range: std::ops::RangeInclusive<f32>,
-    hover: &str,
-) {
-    ui.label(label).on_hover_text(hover);
-    ui.add(egui::DragValue::new(&mut band.freq_hz).range(freq_range).suffix(" Hz").speed(5.0));
-    ui.add(
-        egui::DragValue::new(&mut band.gain_db)
-            .range(sdroxide_types::TxEqState::GAIN_DB_RANGE)
-            .suffix(" dB")
-            .speed(0.2),
-    );
-    ui.add(egui::DragValue::new(&mut band.q).range(q_range).speed(0.02));
-    ui.end_row();
 }
 
 pub(in crate::app) fn enum_combo<T: PartialEq + Copy>(
@@ -1082,7 +1067,7 @@ impl SdroxideApp {
         let mut digi_edit = self.digi_cfg_edit.clone();
         let digi_seeded = self.digi_cfg_seeded;
         let mut region_edit = self.region_edit;
-        let mut tx_eq_edit = self.state.tx.eq;
+        let mut open_tx_audio = false;
         let mut net_edit = self.net_cfg_edit.clone();
         let mut net_cmds = self.net_cluster_cmds.clone();
         let mut rbn_cmds = self.net_rbn_cmds.clone();
@@ -1094,11 +1079,15 @@ impl SdroxideApp {
         let mut rigctld_apply = false;
         let mut wsjtx_edit = self.wsjtx_edit.clone();
         let mut wsjtx_apply = false;
+        let mut picup_edit = self.picup_edit.clone();
+        let mut picup_apply = false;
         let mut rot_edit = self.rot_cfg_edit.clone();
         let mut rot_apply = false;
         let mut relay_edit = self.relay_edit.clone();
         let mut relay_apply = false;
         let mut relay_test: Option<u8> = None;
+        let mut amp_edit = self.amp_edit.clone();
+        let mut amp_apply = false;
         let mut input_edit = self.input.cfg.clone();
         let mut key_capture = self.input.key_capture;
         let mut midi_learn = self.input.midi_learn;
@@ -1264,11 +1253,15 @@ impl SdroxideApp {
                             rigctld_apply: &mut rigctld_apply,
                             wsjtx_edit: &mut wsjtx_edit,
                             wsjtx_apply: &mut wsjtx_apply,
+                            picup_edit: &mut picup_edit,
+                            picup_apply: &mut picup_apply,
                             rot_edit: &mut rot_edit,
                             rot_apply: &mut rot_apply,
                             relay_edit: &mut relay_edit,
                             relay_apply: &mut relay_apply,
                             relay_test: &mut relay_test,
+                            amp_edit: &mut amp_edit,
+                            amp_apply: &mut amp_apply,
                             input_edit: &mut input_edit,
                             key_capture: &mut key_capture,
                             midi_learn: &mut midi_learn,
@@ -1285,7 +1278,7 @@ impl SdroxideApp {
                             radio_tabs: &mut radio_tab_reqs,
                             radio_name_edit: &mut radio_name_edit,
                             region_edit: &mut region_edit,
-                            tx_eq_edit: &mut tx_eq_edit,
+                            open_tx_audio: &mut open_tx_audio,
                             tab: &mut tab,
                             upload_tab: &mut upload_tab,
                         },
@@ -1360,6 +1353,11 @@ impl SdroxideApp {
             // The engine persists wsjtx.json when it opens the socket.
             cmds.push(Command::SetWsjtxConfig(self.wsjtx_edit.clone()));
         }
+        self.picup_edit = picup_edit;
+        if picup_apply {
+            // The engine persists picupload.json and announces it back.
+            cmds.push(Command::SetPictureUploadConfig(Box::new(self.picup_edit.clone())));
+        }
         self.rot_cfg_edit = rot_edit;
         if rot_apply {
             // The engine persists rotator.json when it (re)starts the client.
@@ -1374,6 +1372,11 @@ impl SdroxideApp {
         }
         if let Some(channel) = relay_test {
             cmds.push(Command::TestRelay { channel });
+        }
+        self.amp_edit = amp_edit;
+        if amp_apply {
+            // The engine persists amp.json when it (re)opens the port.
+            cmds.push(Command::SetAmpConfig(Box::new(self.amp_edit.clone())));
         }
         self.sat_ui = sat_ui;
         if self.sat_cfg_seeded && sat_edit != self.sat_cfg_edit {
@@ -1756,12 +1759,8 @@ impl SdroxideApp {
             sdroxide_types::set_region(region_edit);
             cmds.push(Command::SetRegion(region_edit));
         }
-        // The transmit EQ: live `RadioState`, applied the moment a band
-        // changes, same as the region above. There is no per-backend config
-        // to wait on, so no APPLY step either.
-        if tx_eq_edit != self.state.tx.eq {
-            self.state.tx.eq = tx_eq_edit;
-            cmds.push(Command::SetTxEq(tx_eq_edit));
+        if open_tx_audio {
+            self.tx_audio.open = true;
         }
     }
 
@@ -1793,6 +1792,7 @@ impl SdroxideApp {
             (SettingsTab::Winlink, "Winlink"),
             (SettingsTab::Servers, "Servers"),
             (SettingsTab::TrSwitch, "T/R switch"),
+            (SettingsTab::Amp, "Amplifier"),
         ];
         // Next to Servers: the two are the same subject from opposite ends —
         // what this station offers others, and where this screen goes.
@@ -2396,55 +2396,35 @@ impl SdroxideApp {
                     drive_trim_table(ui, cfg);
                     ui.separator();
                     ui.label(
-                        RichText::new("Transmit EQ")
+                        RichText::new("Transmit audio")
                             .size(14.0)
                             .strong()
                             .color(crate::theme::CYAN()),
                     );
                     ui.add_space(4.0);
-                    crate::chrome::checkbox(ui, &mut io.tx_eq_edit.enabled, "Enabled").on_hover_text(
-                        "A 3-band parametric EQ on the microphone audio, ahead of the modulator. \
-                         Voice modes only (SSB/AM/FM); digital modes and CW carry synthesized or \
-                         keyed audio that never reaches it. Off by default and flat when turned \
-                         on, so enabling it changes nothing on the air until a band below is \
-                         actually moved. Applies immediately.",
-                    );
-                    ui.add_space(4.0);
-                    egui::Grid::new("tx-eq-grid").num_columns(4).spacing([10.0, 6.0]).show(
-                        ui,
-                        |ui| {
-                            ui.label("");
-                            ui.label(RichText::new("Freq").weak());
-                            ui.label(RichText::new("Gain").weak());
-                            ui.label(RichText::new("Q / Slope").weak());
-                            ui.end_row();
-
-                            tx_eq_band_row(
-                                ui,
-                                "Low shelf",
-                                &mut io.tx_eq_edit.low,
-                                sdroxide_types::TxEqState::LOW_FREQ_HZ_RANGE,
-                                sdroxide_types::TxEqState::SHELF_SLOPE_RANGE,
-                                "Cuts/boosts rumble and handling noise.",
-                            );
-                            tx_eq_band_row(
-                                ui,
-                                "Mid peak",
-                                &mut io.tx_eq_edit.mid,
-                                sdroxide_types::TxEqState::MID_FREQ_HZ_RANGE,
-                                sdroxide_types::TxEqState::MID_Q_RANGE,
-                                "Presence: a narrow bump or dip somewhere in the voice band.",
-                            );
-                            tx_eq_band_row(
-                                ui,
-                                "High shelf",
-                                &mut io.tx_eq_edit.high,
-                                sdroxide_types::TxEqState::HIGH_FREQ_HZ_RANGE,
-                                sdroxide_types::TxEqState::SHELF_SLOPE_RANGE,
-                                "Brightness/de-ess.",
-                            );
-                        },
-                    );
+                    ui.horizontal_wrapped(|ui| {
+                        let voice = &self.state.tx.voice;
+                        let on = if voice.bypass {
+                            "bypassed".to_string()
+                        } else if voice.active() {
+                            "in use".to_string()
+                        } else {
+                            "every stage off".to_string()
+                        };
+                        if ui
+                            .button("Open TX Audio…")
+                            .on_hover_text(
+                                "The microphone processing chain — gate, EQ, de-esser, \
+                                 compressor and limiter — with a test recording to tune it \
+                                 by ear without transmitting. Voice modes only. Also opened \
+                                 by clicking Mic in the TX box.",
+                            )
+                            .clicked()
+                        {
+                            *io.open_tx_audio = true;
+                        }
+                        ui.label(RichText::new(format!("Chain {on}.")).weak());
+                    });
                 }
                 ui.separator();
 
@@ -3237,12 +3217,14 @@ impl SdroxideApp {
                 // editable, so a service can still be set up before auto-upload
                 // is switched on.
                 let auto_on = io.net_edit.auto_upload;
+                let wavelog_was_on = io.net_edit.wavelog.auto_upload;
                 let enable = match target {
                     UploadTarget::Eqsl => &mut io.net_edit.auto_upload_eqsl,
                     UploadTarget::QrzLogbook => &mut io.net_edit.auto_upload_qrz,
                     UploadTarget::HamQth => &mut io.net_edit.auto_upload_hamqth,
                     UploadTarget::ClubLog => &mut io.net_edit.auto_upload_clublog,
                     UploadTarget::Wrl => &mut io.net_edit.auto_upload_wrl,
+                    UploadTarget::Wavelog => &mut io.net_edit.wavelog.auto_upload,
                 };
                 ui.add_enabled_ui(auto_on, |ui| {
                     crate::chrome::checkbox(
@@ -3255,6 +3237,13 @@ impl SdroxideApp {
                          ticked here is not pushed until it is.",
                     );
                 });
+                // The moment Wavelog auto-upload goes on is where its retry
+                // queue starts: what is logged from now on is owed until the
+                // server has it, and what came before is the backlog, sent
+                // only when asked. See `WavelogConfig::auto_upload_since`.
+                if !wavelog_was_on && io.net_edit.wavelog.auto_upload {
+                    io.net_edit.wavelog.auto_upload_since = crate::time::now_unix();
+                }
                 if !auto_on {
                     ui.label(
                         RichText::new(
@@ -3319,6 +3308,9 @@ impl SdroxideApp {
                         net_secret(ui, "Club Log pass", &mut io.net_edit.clublog.password, 140.0);
                         net_secret(ui, "Club Log key", &mut io.net_edit.clublog_api_key, 200.0);
                     }
+                    // Its own test row, placed between the server and the
+                    // station locations the test lists.
+                    UploadTarget::Wavelog => self.wavelog_settings(ui, io, cmds),
                     UploadTarget::Wrl => {
                         net_secret(ui, "WRL API key", &mut io.net_edit.wrl_api_key, 240.0);
                         ui.label(
@@ -3336,7 +3328,7 @@ impl SdroxideApp {
 
                 // Only where the engine is in this process: the result is not
                 // sent to remote clients, so a button there would spin for ever.
-                if !self.ctrl.engine_is_remote() {
+                if !self.ctrl.engine_is_remote() && target != UploadTarget::Wavelog {
                     self.login_test_row(ui, cmds, io.net_edit, target.login_target());
                 }
 
@@ -3372,6 +3364,10 @@ impl SdroxideApp {
                         *io.net_sync = true;
                     }
                 });
+
+                ui.add_space(10.0);
+                ui.separator();
+                self.picup_section(ui, cmds, io.picup_edit, io.picup_apply);
             }
             SettingsTab::FreeDv => {
                 if !net_seeded_note(ui, io.net_seeded) {
@@ -3442,6 +3438,16 @@ impl SdroxideApp {
                     &self.relay_devices,
                     io.relay_apply,
                     io.relay_test,
+                );
+            }
+            SettingsTab::Amp => {
+                amp::settings_amp_tab(
+                    ui,
+                    io.amp_edit,
+                    self.amp_seeded,
+                    &self.amp_status,
+                    &self.serial_ports,
+                    io.amp_apply,
                 );
             }
             #[cfg(not(target_arch = "wasm32"))]

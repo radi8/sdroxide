@@ -18,7 +18,8 @@ or connects to a remote sdroxide server.
 2. [Basic operation](#2-basic-operation)
     - [2.20 HD Radio (NRSC-5)](#220-hd-radio-nrsc-5)
     - [2.22 QO-100 beacon plugin](#222-qo-100-beacon-plugin)
-3. [Digital modes (FT8, FT4, FT2, MSK144, JT65, JT9, FST4, Q65, FSK441, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, PI4, packet, APRS, ADS-B, NAVTEX, ACARS, VDL2, AIS, HFDL, AtCHAT NET)](#3-digital-modes)
+    - [2.23 Hardrock amplifier](#223-hardrock-amplifier)
+3. [Digital modes (FT8, FT4, FT2, MSK144, JT65, JT9, FST4, Q65, FSK441, JTTY, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, PI4, packet, APRS, ADS-B, NAVTEX, ACARS, VDL2, AIS, HFDL, AtCHAT NET)](#3-digital-modes)
     - [3.17 AtCHAT NET](#317-atchat-net)
     - [3.18 ACARS](#318-acars-airline-datalink-on-airband)
     - [3.19 HFDL](#319-hfdl-aircraft-on-shortwave)
@@ -28,6 +29,7 @@ or connects to a remote sdroxide server.
     - [3.23 FST4](#323-fst4)
     - [3.24 Q65](#324-q65)
     - [3.25 FSK441](#325-fsk441)
+    - [3.26 JTTY](#326-jtty)
 4. [Skimmers (CW, PSK, RTTY)](#4-skimmers)
 5. [ISM band decoder (315 / 345 / 433 / 868 / 915 MHz devices)](#5-ism-band-decoder)
 6. [Settings](#6-settings)
@@ -326,7 +328,7 @@ popup with three rows:
   has a standard calling frequency carry a cyan underline; see
   [§3.1](#31-general-considerations).
 - **MODE:** `LSB USB CW AM SAM NFM WFM DRM HD DIGU DIGL DSB ISB SPEC`.
-- **DIGITAL:** `FT8 FT4 FT2 JS8 WSPR PI4 MSK144 JT65 JT9 FST4 Q65 FSK441 PSK RTTY RTTY-FM OLIVIA THOR FSQ ATCHAT HELL SSTV SSTV-FM RIFP WEFAX NAVTEX ACARS RFPAINT RADE PACKET PACKET-HF APRS ADS-B VDL2 AIS HFDL` (see
+- **DIGITAL:** `FT8 FT4 FT2 JS8 WSPR PI4 MSK144 JT65 JT9 FST4 Q65 FSK441 JTTY PSK RTTY RTTY-FM OLIVIA THOR FSQ ATCHAT HELL SSTV SSTV-FM RIFP WEFAX NAVTEX ACARS RFPAINT RADE PACKET PACKET-HF APRS ADS-B VDL2 AIS HFDL` (see
   [Digital modes](#3-digital-modes)).
 
 On a desktop or tablet layout the popup carries a **DOCK** chip. It moves the
@@ -462,6 +464,16 @@ mode. What is in the box never changes; only where the two rows are cut does.
   inside a transmission — which is what a modem needs and what an AGC, attacking
   in two milliseconds, is the opposite of. So whatever you set here, FT8 sees
   the same signal.
+
+  On a radio that does its own demodulating — an Icom on a serial cable with
+  its audio on a sound card, or on its network port receiving **AF** — the
+  setting is sent to the *radio's* AGC, because the audio has already been
+  levelled there and nothing on this side could be heard to change. Icom's AGC
+  has `Fast`, `Mid` and `Slow` but no way to be switched off from a computer,
+  so there the control offers `Slow`, `Med` and `Fast` only. On an Icom's
+  **12 kHz IF** sdroxide does the demodulating, the AGC is its own, and `Off` is
+  back. A mode you had saved with the AGC off comes up on that mode's usual
+  setting instead, and is still off when you next use it where `Off` exists.
 - **Man** — the fixed audio gain the receiver runs on while the AGC is `Off`,
   shown only then. Unlevelled audio is whatever the band delivered, and a weak
   SSB signal can sit tens of dB below anything the volume control can reach, so
@@ -1397,29 +1409,130 @@ On a TX-capable rig the **Transmit** module appears:
   of this applies and the rail does not appear: there the modulator and Drive
   own the level.
 
-**Transmit EQ** (Settings → Radio, above the per-interface section, since it
-applies the same way whichever radio interface is selected) is a 3-band
-parametric equalizer on the microphone audio, ahead of the modulator: **Low
-shelf** (cuts/boosts rumble and handling noise), **Mid peak** (presence, a
-narrow bump or dip somewhere in the voice band), and **High shelf**
-(brightness/de-ess). Each band has its own frequency and gain (dB), and the
-mid band also has a **Q** (how narrow the bump is) while the two shelves have
-a **Slope** instead (how sharply they roll off). Off by default, and flat
-(0 dB every band) the first time you turn it on, so enabling it changes
-nothing until you actually move a slider. Voice modes only (SSB/AM/FM);
-digital modes and CW carry synthesized or keyed audio that never reaches it.
-Applies immediately, like the IARU region setting: there is no Apply step —
-including while you are transmitting, so you can set it by ear against the
-transmit monitor.
+**Transmit audio** is the microphone processing chain: a noise gate, an
+equalizer, a de-esser, a compressor and an output limiter, all between **Mic**
+gain (plus the chain's own **Input** gain) and the modulator. Open the **TX Audio** window by clicking the **Mic**
+label in the transmit box (it turns cyan while the chain is doing something),
+or from Settings → Radio → **Open TX Audio…**. Everything is off the first time,
+and with everything off the chain is a straight wire: the audio leaves exactly
+as it arrived. Every change applies at once, including while you are
+transmitting, so you can set it by ear against the transmit monitor.
 
-It sits after **Mic** gain and before whatever modulates the audio, on every
-interface: a radio sdroxide modulates itself, and a rig that modulates its own
-audio (a CAT rig over its sound card, TCI, Icom LAN, SmartSDR) alike. Boosting
-a band therefore raises the level going into the transmitter, and there is
-nothing behind it but a limiter at full scale — on a transmitter, clipping is
-splatter on your neighbours' frequencies. **After boosting anything, watch the
-ALC/TX meter and take the same amount back off Mic gain.** Cutting is free; a
-cut band and a little more mic gain gets the same tone with none of the risk.
+The left of the window is the chain, in the order the audio meets its stages.
+Tick a stage to switch it on, use ▲▼ to move it earlier or later, and click
+its name to see its settings. **Output** is always last. Across the top:
+
+- **BYPASS** takes the whole chain out without forgetting how it is set, for
+  an A/B comparison.
+- **DENOISE** runs the neural noise reduction (RNNoise) over the microphone
+  ahead of everything else. It removes fans and room hum well, but it pulls the
+  level down a little; give it back with the compressor's makeup or the output
+  trim.
+- **DIGITAL VOICE** decides whether FreeDV and RADE go through the chain too.
+  Off by default: a codec built for speech usually does best with the
+  microphone as it is.
+- **⏺ REC / ▶ PLAY** record up to 30 seconds of your voice and play it back
+  through the chain as it is set now, without transmitting. What is recorded is
+  the raw microphone, so you can change a setting and play the same phrase
+  again to hear what the change did.
+- **🎧 LIVE** puts your microphone through the chain as you talk and plays it
+  to you, without transmitting. **Use headphones**: through speakers it feeds
+  back into the microphone. You hear yourself a few tens of milliseconds late,
+  which makes talking awkward, so use LIVE for a quick check and REC / PLAY to
+  judge the sound. Receive audio is replaced while it runs.
+- **METERS** does the same for the meters only: nothing on the speakers, so no
+  delay to talk against and nothing to feed back. This is the way to set your
+  levels, the gate threshold and how hard the compressor works. Receive audio
+  carries on.
+
+  LIVE and METERS stop when you press PTT (the transmitter needs the
+  microphone), and are not available while transmitting.
+
+Under that is the **Level** row:
+
+- **Mic** is the same control as the Mic rail in the transmit box, shown here in
+  dB: 0 dB at the middle, +6 dB at the top. It is shared by every profile.
+- **Input** is extra gain for this microphone, from −12 to +24 dB, and it is
+  saved with the profile. Use it when Mic at the top is still not enough. It is
+  level setting, not processing, so BYPASS leaves it in, and it applies to
+  FreeDV/RADE even when DIGITAL VOICE is off.
+- **Auto-set** listens for six seconds while you talk as you would on the air,
+  then sets Input so your voice peaks around −10 dBFS on the IN meter. It
+  switches METERS on for the measurement if it is not already on. The presets'
+  gate and compressor thresholds assume that level, so run Auto-set before
+  loading one.
+
+The stages:
+
+- **Gate** silences the microphone between words, so the station's room noise
+  is not on the air in the gaps. **Threshold** is the level that opens it,
+  **Return** how far below that it has to fall to close again (so it does not
+  chatter on a word's tail), and **Hold** and **Release** how long it waits and
+  how gently it closes. **Floor** is how far it turns down while closed: −15 dB
+  is gentler than true silence. **EXPANDER** swaps the closed/open switch for a
+  ratio, which turns quiet sounds down progressively and is less noticeable.
+  The gate looks a moment ahead, so it is already open when a word starts.
+- **EQ** is a high-pass, a low shelf, two peaks, a high shelf and a low-pass.
+  Drag the points on the curve or type the figures. The high-pass and low-pass
+  have a 12 or 24 dB/octave slope; click the slope to switch. The yellow line at
+  2.7 kHz is where a typical SSB transmit filter stops, so anything above it is
+  boosted for nothing. **FLAT** puts every band back to 0 dB.
+- **De-esser** turns down only the "s" and "sh" band (around 6 kHz by default)
+  when it gets louder than **Threshold**, by at most **Amount**, and leaves the
+  rest of the voice alone.
+- **Compressor** brings loud syllables down towards the quiet ones, so the
+  average power rises without the peaks rising. **Threshold**, **Ratio**,
+  **Knee**, **Attack**, **Release** and **Makeup** work as on any compressor,
+  and the curve shows what it does to each input level. **Drive** pushes the
+  voice into the compressor harder. **Phase** shifts the timing of the low
+  frequencies against the high ones, which makes a voice's waveform more
+  symmetrical, so the peaks are lower for the same sound and the same peak
+  level carries more average power.
+- **Output** is a **Trim** in dB and a **Limiter** with a **Ceiling**. The
+  limiter looks ahead, so no peak ever gets past the ceiling.
+
+The meters show the level going in and coming out, and how much each stage is
+turning the audio down right now. They move while you transmit, play the test
+phrase, or run LIVE or METERS.
+
+**Profiles** save the chain, including its Input gain, under a name and load it
+back. **Export** and **Import** carry a profile across as a JSON file. A profile
+does not change the DIGITAL VOICE switch.
+
+The **Starting points** are named for what you are doing, not for a
+microphone (Input gain takes care of the microphone). Loading one keeps your
+Input gain. They are only starting points: record a phrase and tune from them.
+
+| Preset | For | What it does |
+|---|---|---|
+| **Natural** | Ragchews, local contacts | Denoise, 80 Hz high-pass, gentle expander, light 2:1 compression, limiter |
+| **SSB everyday** | Normal SSB | 100 Hz – 2.9 kHz, a little presence at 2 kHz, 3:1 compression, limiter |
+| **SSB punch / DX** | Weak signals, pileups | Narrow 300 Hz – 2.7 kHz, strong presence lift, Drive into a fast 6:1 compressor with Phase, limiter. Most talk power, not hi-fi. |
+| **Contest** | Long sessions in a noisy station | SSB punch plus denoise, a hard gate and harder compression |
+| **ESSB / hi-fi** | Wide SSB, AM | 50 Hz – 4 kHz with the low end kept, de-esser, gentle compression. Needs a transmit filter that wide. |
+| **FM / repeater** | FM | Steep 300 Hz high-pass to keep the voice clear of the CTCSS tone (67–254 Hz), stops at 3 kHz for the channel, limiter at −2 dB to hold deviation |
+| **Mobile / noisy shack** | Fans, engine, traffic | Denoise, steep 150 Hz high-pass, hard gate, 4:1 compression |
+| **Digital voice** | FreeDV / RADE | Denoise and gentle levelling only, no EQ. Also turns DIGITAL VOICE on. |
+
+Your saved profiles live in
+`tx_audio_profiles.json` on the machine the window runs on. The chain as it is
+set now is part of the radio state, so it comes back after a restart and is
+saved in station profiles.
+
+Which audio goes through it: voice in SSB, AM and FM from the microphone, and
+FreeDV/RADE only when DIGITAL VOICE is on. Audio from a **TCI client** never
+does: a program that sends its own audio has already shaped it. Digital modes
+and CW carry synthesized or keyed audio that never reaches it. On a rig that
+modulates its own audio (a CAT rig over its sound card, TCI, Icom LAN,
+SmartSDR) the chain runs before the audio leaves for the rig, so the rig's own
+speech processor still follows it; use one or the other, not both.
+
+Boosting an EQ band, Makeup, Drive or Trim raises the level going into the
+transmitter, and on a transmitter clipping is splatter on your neighbours'
+frequencies. **After raising anything, watch the ALC/TX meter, and take the
+same amount back off Mic gain or switch the output limiter on.** Cutting is
+free; a cut band and a little more mic gain gets the same tone with none of
+the risk.
 
 > **Transmit safety:** by default sdroxide refuses to transmit outside the
 > amateur bands (`tx_ham_only`), and stops the transmission if the radio reports
@@ -2884,7 +2997,7 @@ replaces what you hear rather than filtering it — decoded FreeDV/RADE speech, 
 a voice-keyer message you are monitoring — the recording follows the speaker.
 
 On transmit, it takes the audio sdroxide sends: the microphone after mic gain
-and the transmit EQ, with any CTCSS tone or 1750 Hz burst that goes under it; a
+and the transmit audio chain, with any CTCSS tone or 1750 Hz burst that goes under it; a
 digital mode's burst; the CW keyer's sidetone; and, for a tune-up, a 1 kHz tone
 at the tune level standing in for the unmodulated carrier — without which the
 file would go quiet for the tune and drift out of step with real time, a little
@@ -3204,6 +3317,215 @@ The plugin runs on the machine the radio is on. Its readout is not sent to
 remote or browser clients yet, so on those the window opens, the strip draws
 from the shared spectrum, and the status line says the readout is local to the
 receiving station.
+
+### 2.23 Hardrock amplifier
+
+![The AMP window](images/amp-window.png)
+
+sdroxide can watch and control a **HobbyPCB Hardrock-500** linear amplifier
+over its USB serial port. The **AMP** window shows its meters and readings,
+works out input power, efficiency and gain while you transmit, and runs its
+ATU-500 tuner. The amplifier is still keyed by the radio's PTT line, as before;
+sdroxide never keys it.
+
+> **Tested only with the Hardrock-500.** The Hardrock-50 can be chosen and is
+> marked *untested*: it shares the command set, but its limits are scaled
+> from the Hardrock-500's and its built-in tuner is shown as raw steps. Watch the amplifier's
+> own display until it has been tried on a real one.
+>
+> The panel has been tested on Windows 11 only.
+
+#### Setting it up
+
+Open **⚙ SETTINGS ▸ Amplifier** ([§6](#6-settings)):
+
+- **Enable**, then choose the **Model** and the **Port** the amplifier's USB
+  lead appears as.
+- **Baud** must match the amplifier's menu. HobbyPCB's own control panel needs
+  115200, so an amplifier that has been used with it is already there.
+- **Follow the radio's band** sends the transmit frequency to the amplifier on
+  every band change, so its filters follow the radio without a CAT cable of
+  their own. It is never sent during a transmission.
+- **Show its power and SWR on the TX meter** fills the TX meter from the
+  amplifier when the radio doesn't measure them itself, and only while the
+  amplifier is in line.
+
+Press **APPLY**. The status line reads *Connected to the Hardrock-500* when the
+amplifier answers. The settings belong to the station and are kept in
+`amp.json` ([§13](#13-configuration-files)), like the T/R switch: the
+amplifier is on a port of the machine the radio is attached to.
+
+Open the window with the **AMP** chip in the System module.
+
+#### The window
+
+**What can be clicked.** Anything in the window that does something when
+clicked shows a pointing hand and a white outline when the mouse is over it.
+If the outline appears, it's a control; if it doesn't, it's only a display.
+PTT / OFF and the TEMP tile, which would otherwise look like a light and a
+reading, also carry a small folded corner at the top right. A button greyed
+out by an interlock (see below) shows no outline, because clicking it does
+nothing.
+
+**Meters.** Two cross-needle meters, each with a white outer needle and a blue
+inner one. Choose what each needle shows with its **TOP** and **BOTTOM**
+pickers: forward power, reflected power, drive, supply volts or drain current.
+They start as FWD over DRV on the left, so the power meter shows the radio's
+drive going in beside the amp's output, and IDD over RFL on the right.
+Picking a reading already on the other needle swaps them. The needles are
+live; they don't hold peaks. Every scale shows its yellow and red stretches,
+and readings that run past the end are marked beyond the arc with their
+values, so the limits are always in view.
+
+**When a scale changes range.** The meters start on their full scales: until
+power is first seen, the amplifier is taken to be in line and ready to make
+full power. Only these change a scale's range, and the legend always says so:
+
+| When | What changes | Legend | Back |
+|---|---|---|---|
+| The power stays at 10 W or less for 2.5 s while transmitting, in line or in bypass | FWD and DRV to 0–10 W, RFL to 0–2 W | *10 W scale* | To full scale at once when the amp is in line and the power goes over 10 W |
+| In OFF (bypass), the power goes over 10 W for 2 s in all, or swings over it twice | FWD and DRV to 0–100 W, RFL to 0–20 W: a 100 W radio running through the bypassed amp | *100 W scale* | Down to the 10 W scale once the power settles at 10 W or less for 2.5 s |
+| The power goes over 100 W, or over 10 W with the amp in line | FWD, DRV and RFL to their full scales | (none) | (this is the start) |
+| Two needles on one meter would sit on top of each other | The inner (bottom) scale only, to ½, ⅕ or 2× its range, whichever parts them, so both can be read | *rescaled* | Once the needles are well apart on the usual scale |
+
+In OFF (bypass) the radio's own power passes straight through the amp, so the
+power counted is the higher of FWD and DRV. Most operators who run the amp in
+bypass do so with a QRP radio, which the 10 W scale suits; a 100 W radio gets
+the 100 W scale after its first couple of seconds. Going up to the full scales
+never waits, so a needle is never held pinned at real power; coming down waits
+for the power to settle.
+
+A power range and a rescale can apply at once (*10 W scale, rescaled*).
+
+**Running barefoot in bypass.** In OFF the DRV tile stays green whatever it
+reads, tuner in or not, because the radio's power passing straight through is
+not a fault. **PTT** is greyed while the drive is over the amplifier's drive
+limit (8 W on the HR500): hover over it to see why, and lower the radio's
+power before putting the amplifier in line.
+
+In OFF the amplifier reports no forward or reflected power and no SWR, so
+those come from the radio while it transmits:
+
+- **SWR:** the radio's own SWR reading, where it reports one over CAT.
+- **FWD:** the watts the radio measures, where it reports watts. Otherwise the
+  amplifier's DRV reading, which measures the radio's power at the amplifier's
+  input; in bypass that power goes straight through.
+- **RFL:** the reflected watts the radio measures, where it reports them.
+  Otherwise worked out from FWD and the SWR: at 3:1 a quarter of the forward
+  power comes back.
+
+The meter legend says where each came from (*from the rig*, *from DRV*, *from
+the rig's SWR*), and so does hovering over the tile. The ELAD FDM-DUO reports
+all three (forward and reflected power in milliwatts, and the SWR), so with a
+DUO everything comes from the radio. Its readings are blank below 0.5 W, and
+whenever the DUO marks them as not to be trusted, for example folding its power
+back into a bad match: the legend then says *the rig flagged its reading*.
+DRV is never used in their place with a DUO, because it over-reads into a
+mismatch. In
+PTT the amplifier's own readings are always used, here and on SDRoxide's main
+TX meter.
+
+**FDM-DUO power buttons.** With an ELAD FDM-DUO connected and its Rig
+control (CAT) port set, four buttons sit beside the Drive slider in the TX
+box: **1W**, **3W**, **5W** and **MAX**, captioned *ELAD FDM-DUO TX PWR*. They
+appear for no other radio, not for the FDM-S2, and not for a DUO on its
+receive cable alone. Each sets the DUO's own power setting, menu 34
+`TX POWER`, to 1.0 W, 3.0 W, 5.0 W or MAX; the one in use is lit. Drive and
+Tune then set the power within it. Your choice is saved and sent again each
+time SDRoxide connects; until you pick one it is MAX.
+
+Use **MAX** with the HR500 in line: at 5 W the DUO cannot drive the amplifier
+to full output on most bands. Bring the power down with Drive instead. 1W, 3W
+and 5W are for running barefoot or QRP. Each menu 34 step lets slightly more
+out than it says: measured with a known-good wattmeter, 1 W gave 1.4 W, 3 W
+3.8 W and 5 W about 6 W at Drive 100%.
+
+**Drive on the FDM-DUO.** Drive sets the power through the transmit audio,
+within menu 34's setting. The DUO reaches its full output (about 8 W at MAX)
+with only a quarter of full audio, so SDRoxide sends at most that: at MAX,
+Drive 100% is about 8 W, 50% about 4 W, and the output rises in a straight
+line from about 0.5 W at the bottom. Before this, everything from about 25% up
+gave the same 8 W.
+
+
+**Readings.** Seven tiles: FWD, RFL, DRV, VDD, IDD, TEMP and SWR. Each takes
+the amplifier's own colour for that reading: green, yellow or red. A colour
+the amplifier holds after a transmission (it latches red until the next
+key-up) is held here too, with one exception. Until your first transmission
+after SDRoxide connects, a yellow from the amplifier shows green. The HR500 can
+start up with DRV yellow, or still hold a yellow from an earlier session, with
+nothing wrong now, and from remote that would look like a fault. A red (a
+trip) always shows. From your first key-up the tiles follow the amplifier's
+lights exactly, so its own screen and this one can differ only before then.
+SWR has no colour of its own, as on the amplifier, except that it turns **red**
+at or past the tune limit (Settings → General, shown beside the SWR limit).
+There, a meter showing FWD or RFL measured by the radio says so across its
+top in large red letters, for example *FWD UNRELIABLE AT THIS SWR*, and the
+tiles say why on hover: into an open the FDM-DUO reported about three times
+the power a wattmeter read, and only its SWR was right. Click
+**TEMP** to switch between °C and °F; it switches the amplifier's own display
+as well.
+
+**Controls.**
+
+- **PTT / OFF** puts the amplifier in line (green) or in bypass (blue).
+- **ANT** chooses the antenna jack.
+- **DN / UP** step the band.
+
+**Performance.** Input power (volts × amps), efficiency (output over input) and
+gain (output over drive, in dB), worked out only while transmitting. The
+number holds its peak for a second and then falls away; the bar under it is
+live, with the held peak marked on it. This suits FT8 and SSB, where the
+readings move too fast to read.
+
+**Tuner.** A drawing of the ATU-500's network: the inductor and capacitor it
+has switched in, with values, and which side the capacitor is on. When the
+tuner is bypassed, the drawing shows the bypass relays instead.
+
+- **TUNE** starts a tune. It blinks blue while tuning, turns green when tuned
+  and red if the tune fails, with the result and SWR on the line below.
+- **ON / BYP** puts the tuner in line or bypasses it.
+
+The tuner only reports step numbers. The values shown (for example "~0.20 µH ·
+step 3") are an estimate that includes the board's own stray inductance and
+capacitance, judged good to about 10%. The capacitance adds up the capacitors the
+tuner's relays switch in, as its firmware drives them, so it isn't a straight
+number per step. How the values were arrived at is in
+`docs/hardrock/atu-values.md`.
+
+**Pop out.** **POP OUT** moves the window into one of its own, which you can
+put on another screen and resize; **DOCK** brings it back. Popped out, the
+panel scales to fit the window's width and height and sits centred in it. In a
+browser the window stays inside the page.
+
+**Comes back as you left it.** When sdroxide starts, the AMP window comes back
+as it was when sdroxide closed: open or closed, docked or popped out, in the
+same place and at the same size, with the same meter picks.
+
+#### What sdroxide won't do while you transmit
+
+Switching a relay with RF on it can damage it, and on the Hardrock it makes the
+amplifier flag reflected power. So while there is RF in the amplifier, sdroxide
+won't switch the antenna, band or tuner:
+
+- **ANT**, **DN**, **UP** and **ON / BYP** are greyed out, and hovering over
+  them says why. Unkey first.
+- The amplifier is asked whether it is transmitting before any of those is
+  sent, and the command is dropped if it is, or if it doesn't answer.
+- **Follow the radio's band** waits until the transmission is over.
+- **PTT** can't be switched on (OFF to PTT) while the drive is over the
+  amplifier's drive limit, 8 W on the HR500, as with a 100 W radio running
+  barefoot through the bypassed amp. Lower the drive first.
+
+Each of these is marked *SAFETY INTERLOCK* in the code and explained in
+`docs/hardrock/safety-interlocks.md`.
+
+#### Trips and over-temperature
+
+When the amplifier trips, the status line at the top of the window turns red
+and says *TRIPPED*, naming the reading that tripped it. Above its temperature
+limit it reads *OFF LINE · over temperature*. The amplifier does the
+protecting; sdroxide only reports it.
 
 ---
 
@@ -4334,6 +4656,10 @@ one of the two.
   top — so the header goes out into the gap unless something covers it. Turn it
   up if a WebSDR or OpenWebRX on the far end hears your transmission but shows no
   image; turn it down to 0 on an SDR that keys in milliseconds.
+
+Received pictures can also be put on a web server as they arrive, the way
+QSSTV does it — see [Received pictures → FTP](#received-pictures--ftp) on the
+**Uploads** settings tab.
 
 > **Note:** SSTV decode/encode runs in the server engine, so the panel works the
 > same in the native app and the browser client. RX quality depends on signal
@@ -6205,6 +6531,56 @@ first. There is no automatic sequencing and no station being called: a
 meteor-scatter contact is arranged by ear and by the shorthand, which is what
 the mode has always been.
 
+### 3.26 JTTY
+
+> **Experimental.** JTTY is new — it arrived in the WSJT-X 3.2 release — and
+> this implementation has been checked against the reference encoder bit for
+> bit on its vectors and decoded from its own transmissions in noise, but
+> **not yet off the air**. Treat a decode as worth a second look and a first
+> contact as a test.
+
+Choose **JTTY** from the DIGITAL row. JTTY is the **asynchronous keyboard
+mode** from the WSJT-X 3.2 release: it is worked like RTTY — either side types
+and sends whenever it likes — but carries forward error correction, so a signal
+that would be marginal and error-prone as 45.45-baud RTTY still copies. It is
+about 125 Hz wide, small enough to tuck into a gap in a crowded band.
+
+**It is not slotted.** Unlike FT8/FT4 there is no even/odd turn and no period to
+agree on: a transmission starts at any instant, so there is no clock to watch
+and nothing to synchronise. A message is sent as one or more frames of about
+1.9 s each, back to back.
+
+**What you see.** A rolling log of the messages heard, each with its UTC time,
+audio frequency and SNR. The text is what was decoded: a CQ (`CQ K1ABC CQ`), a
+call, a contest exchange (`599 123`, `1D EMA`, `599 FN42`), a control phrase
+such as `AGN?` or `TU`, or plain text. A message of several frames is **one
+line that grows** as its frames arrive, and stays dimmed until its last frame
+has been heard; a message whose end was lost stays dimmed. Several stations
+sending at once are separate lines.
+
+**Where in the audio it sits.** The audio frequency is the signal's **lowest
+tone**, as in WSJT-X, and defaults to **1500 Hz** (tones 1500–1594 Hz). The
+receiver always searches **1200–1800 Hz** for the lowest tone, plus 50 Hz
+either side of your own audio frequency, so in **USB** most signals near the
+middle of the passband decode without you doing anything. To hear or work a
+station outside that band, click it on the waterfall or set the audio offset as
+in the other digital modes; you transmit on that same frequency. As with FT8,
+the offset is remembered per band.
+
+**Transmitting.** The **TX** row under the log is a single line: type the
+message (`W1ABC W9XYZ FN42`, or one of the exchange forms above) and press
+**TX**; **CALL CQ** fills the box with `CQ <your call> CQ` and sends it. The
+message is sent **once** — JTTY is asynchronous, so there is no period to wait
+for and nothing repeats; the over ends when the burst is done, and pressing
+**SENDING** stops it early. The message is packed for the air automatically: a
+callsign, a contest exchange or a control phrase is sent as its compact typed
+form, and anything else as plain text, five characters a frame. A message can
+be at most 16 frames (about 30 s); if the text is longer, or the box is empty,
+nothing is sent and the reason is shown under the row.
+
+**Where to find it.** There is no calling frequency and the mode is very new;
+tune where the station you want says it will be.
+
 ## 4. Skimmers
 
 The skimmers decode many signals at once across a wide (~192 kHz) window and
@@ -6776,7 +7152,7 @@ look like.
 
 Everything that configures sdroxide lives in one window, opened with the
 **⚙ SETTINGS** button in the System module (the **⚙ SETUP** button in the SPOTS
-window opens the same dialog on its Spots tab). Fourteen tabs run across the top:
+window opens the same dialog on its Spots tab). Fifteen tabs run across the top:
 
 | Tab | What it holds |
 | --- | --- |
@@ -6787,9 +7163,10 @@ window opens the same dialog on its Spots tab). Fourteen tabs run across the top
 | **Controls** | Keyboard, mouse and MIDI bindings. [6.4](#64-controls-keyboard-mouse-and-midi) |
 | **Spots** | DX cluster, POTA, SOTA and PSK Reporter feeds, and the broadcast station list. [6.5](#65-spots-spot-feeds) |
 | **FreeDV** | FreeDV Reporter (qso.freedv.org). [6.6](#66-freedv-freedv-reporter) |
-| **Uploads** | Callsign lookup, QSL upload, confirmation download. [6.7](#67-uploads-callsign-lookup-and-qsl-services) |
+| **Uploads** | Callsign lookup, QSL upload, confirmation download, and received pictures to an FTP server. [6.7](#67-uploads-callsign-lookup-and-qsl-services) |
 | **Winlink** | The radio-email account, and whether it forwards over the internet or on the air. [6.8](#68-winlink-radio-email-account) |
 | **Servers** | Hamlib rigctld, the built-in TCI server, and the WSJT-X UDP broadcast. [6.9](#69-servers-letting-other-programs-drive-the-radio) |
+| **Amplifier** | A HobbyPCB Hardrock on its USB serial port: model, port, baud rate, and whether it follows the radio's band. [2.23](#223-hardrock-amplifier) |
 | **T/R switch** | The relay that grounds the SDR's antenna while the station transmits, and the sequencer around it. [6.11](#611-tr-switch-protecting-the-receiver-on-transmit) |
 | **Remote** | The address of an sdroxide server elsewhere, and the button that connects to it. [8.2](#82-connect-a-native-remote-client) |
 | **TLE** | Satellites to track beyond the amateur set, and their frequencies. [6.10](#610-tle-satellites-and-their-frequencies) |
@@ -6805,7 +7182,7 @@ Settings are written to the per-user config directory ([§13](#13-configuration-
 display preferences to `config.toml`, the radio to `radio.json`, key/mouse/MIDI
 bindings to `input.json`, feeds and credentials to `net.json`, the two servers
 to `rigctld.json`, `tciserver.json` and `wsjtx.json`, the satellite
-additions to `satellites.json`, the transmit/receive switch to `relay.json`,
+additions to `satellites.json`, the transmit/receive switch to `relay.json`, the amplifier to `amp.json`,
 and the saved setups to `profiles.json`.
 
 Most of those files describe the *station*, not the screen: the feeds it
@@ -8278,7 +8655,9 @@ what does the selecting.
 > - **Icom** — the filter-width index, which follows a formula rather than a
 >   per-model table: 50–500 Hz in fifties then 600–3600 Hz in hundreds on a
 >   sideband, and 200 Hz–10 kHz in two-hundreds in AM. FM picks its filter with
->   the mode, so nothing is sent there.
+>   the mode, so nothing is sent there. sdroxide's own RTTY keeps the radio on
+>   USB, with the full range; a radio switched to *its* RTTY at the front panel
+>   only goes to 2.7 kHz, so a wider filter there is sent as 2.7 kHz.
 > - **Kenwood** — `FW` in Hz in CW; on a sideband the rig has no width at all
 >   but a pair of *cuts* (`SL`/`SH`), which is exactly what the panel's two
 >   filter edges are, so they map across directly. Index tables are carried for
@@ -8297,6 +8676,13 @@ what does the selecting.
 > Where a width is not an exact entry in the rig's table it is rounded **up**,
 > so the radio's filter is never quietly narrower than the one on screen — a
 > filter that is too narrow presents as a signal that simply is not there.
+
+> **Note (the AGC on a CAT rig):** for the same reason, the **AGC** control is
+> sent to the radio on an **Icom** — `Slow`, `Med` and `Fast` select its SLOW,
+> MID and FAST presets. Icom has no command that simply switches its AGC off,
+> so `Off` is not offered while the radio is the one demodulating. The other
+> families' AGC, and a **Xiegu**'s, are not commanded yet: there the control
+> only reaches sdroxide's own AGC, behind the radio's.
 
 > **Note (Yaesu):** the S-meter and the transmit SWR come from the radio's own
 > meters (`SM0` and `RM6`), because on a CAT rig there is nothing else to
@@ -9974,8 +10360,11 @@ radio puts in the audio stream (`SET > Connectors > LAN AF/IF Output > Output
 Select`), which decides who does the demodulating:
 
 - **AF — the radio demodulates.** The radio's filters, AGC and detector do the
-  work, and the panadapter is the radio's own scope — see above. This is the safe
-  default and works on every model at every sample rate.
+  work, and the panadapter is the radio's own scope — see above. The receive
+  panel's filter width and AGC are sent to the radio, since its filter and AGC
+  are the ones the audio has been through; the AGC then has no `Off`, which
+  Icom gives no way to set. This is the safe default and works on every model
+  at every sample rate.
 - **12 kHz IF — sdroxide demodulates.** The radio sends its DRM intermediate
   frequency instead of audio. sdroxide mixes it down to baseband and treats it
   as an ordinary receiver front end, so its own filters, noise reduction,
@@ -12125,7 +12514,7 @@ stored in plaintext in `net.json`. How the features behave is
   instead of only on the **LOOKUP** button.
 - **Upload** — **Auto-upload each new QSO** is the master switch, and under it
   is **a tab per logging service**: **QRZ**, **eQSL**, **HamQTH**,
-  **Club Log** and **WRL**. Each tab holds everything about that one service — whether a new
+  **Club Log**, **WRL** and **Wavelog**. Each tab holds everything about that one service — whether a new
   QSO is pushed to it, its login, and the button that checks that login. So
   setting up a service means opening its tab and filling in what is on it,
   rather than picking your fields out of all four services' at once.
@@ -12154,6 +12543,32 @@ stored in plaintext in `net.json`. How the features behave is
     works. **Test WRL** says both whether the key is good and whether that
     default is set, which is the one thing you would otherwise find out a
     contact at a time.
+  - **Wavelog** — your own [Wavelog](https://www.wavelog.org/) server,
+    reached directly, so WaveLogGate is not needed. **Address** is the
+    front-page URL (`https://log.example.org` or
+    `http://192.168.1.10/wavelog`) and **API key** a key from Wavelog's API
+    page; uploading and radio status need a read/write key, downloading works
+    with a read-only one. **Test** checks the key and lists the station
+    locations. For a server with a self-signed certificate, Test shows its
+    SHA-256 fingerprint and **Trust this certificate**; from then on only that
+    exact certificate is accepted, until **Forget this certificate**.
+    - **Station location** — the **Default** location QSOs go to, and the one
+      for **This profile**, which overrides it. Wavelog refuses a QSO whose
+      callsign is not the location's, and the tab warns when they differ.
+    - **Upload** — with the tab's tickbox on, each QSO logged from then on is
+      sent as it is logged. If the server cannot be reached it is retried
+      every 5 minutes, across restarts. QSOs logged before the tickbox went on
+      are not sent by themselves: **Send N QSOs not yet in Wavelog…** sends
+      them after asking.
+    - **Download into this logbook** — at start and every N minutes, fetches
+      what the ticked locations gained since the last download and merges it
+      into the log, so FT8 and the spot lists know those stations are worked.
+      **Sync now** does it at once. **Full resync…** downloads the ticked
+      locations in full and lists what would be added, updated and removed
+      before **Apply**; only contacts that came from Wavelog are ever changed
+      or removed — QSOs logged here or imported from a file are never touched.
+    - **Live radio status** — sends frequency, mode and split to Wavelog's
+      live logging under **Radio name**, from the station's main radio only.
 
   A service's own tickbox only takes effect while the master **Auto-upload each
   new QSO** is on; with it off the tab says so, and the per-QSO **UP** button in
@@ -12200,6 +12615,72 @@ find out.
 - The buttons appear only when the radio is attached to *this* machine. The
   credentials, and the answer naming the account they belong to, live on the
   station computer; a remote client is not shown either.
+
+#### Received pictures → FTP
+
+At the bottom of the tab, **Received pictures → FTP** puts every SSTV picture
+you receive on a web server as soon as it is saved — and, if you tick it, every
+weather chart too. The files are laid out the way QSSTV lays them out, so a web
+page written for QSSTV's FTP upload shows sdroxide's pictures unchanged.
+
+The station does the uploading, wherever you edit the settings from: a remote
+client or the browser sets them up exactly as the console does, and the pictures
+go from the machine the radio is attached to.
+
+| Setting | What it does |
+|---|---|
+| **Server**, **Port** | The FTP server. 21 is usual; implicit FTPS uses 990, and changing **Security** moves the port between the two unless you have typed another. |
+| **Security** | **FTP** sends everything, the password included, unencrypted. **FTPS explicit (AUTH TLS)** connects on the normal port and switches to TLS before logging in — what nearly every server that offers TLS at all supports. **FTPS implicit** is TLS from the first byte. |
+| **User**, **Password** | The account. Empty user logs in as `anonymous`. Stored, like every other credential in the station settings, in the clear. |
+| **Certificate** | How the server's certificate is judged — see below. Shown for the two FTPS choices. |
+| **SSTV** / **SSTV dir** | Upload SSTV pictures (RIFP pictures included — they share the store), into this directory. Empty is the directory you land in when you log in. |
+| **Weather fax** / **WEFAX dir** | The same for weather charts. Give them their own directory: a chart would otherwise push a picture out of the rotation. |
+| **File names** | **image1 … imageN (rotate)**: the newest picture is always `image1`, the one before it `image2`, and so on; **keep** says how many (30, as in QSSTV). **Original file name** keeps the name sdroxide filed it under, so the server keeps everything. |
+| **Format**, **add extension** | PNG or JPEG (quality 85). QSSTV names the rotated files bare (`image1`); **add extension** makes them `image1.png`, which web servers serve with the right type. |
+| **Caption bar** | QSSTV's black bar across the top: time, frequency, mode, and the sender's callsign when an FSK ID or a RIFP manifest gave one — `22:45 Tue Nov 14, 2023 UTC  14230 kHz  Martin 1 de EA4XYZ`. Only the uploaded copy is marked; the picture in your gallery is untouched. |
+| **Fit 960 × 768** | Shrinks anything larger, as QSSTV does. |
+| **checknew.jpg** | QSSTV's heartbeat: a tiny black picture, uploaded beside every one, whose height is the current minute. A web page polls its size to notice a new picture without downloading it. When the program closes it is made two pixels wide — the "station offline" sign the same pages look for. |
+| **NAT workaround** | Ignore a private address in the server's passive-mode reply and connect to the server's own address instead — what a server behind NAT that does not know its public address needs. Harmless otherwise. |
+
+An SSTV picture is held for up to four seconds after its last line, because the
+FSK ID that names its sender is sent *after* the picture; the caption can then
+say who sent it. Each upload goes up under a temporary name and is renamed into
+place, so a page never shows half a picture.
+
+**Certificates (FTPS).** Three choices:
+
+- **System trust store** — the default. The certificate is trusted exactly when
+  the operating system of the station computer trusts it, the way a browser on
+  that machine would: macOS's keychain, Windows' certificate store, or the
+  distribution's CA bundle on Linux. A certificate from a public CA (Let's
+  Encrypt and the like) just works. If the server uses a private CA of your
+  own, paste its certificate (PEM, `-----BEGIN CERTIFICATE-----` …) into
+  **Extra CA**: it is trusted *in addition to* the system's, for this upload
+  only.
+- **Pinned fingerprint** — trusts one certificate, named by its SHA-256
+  fingerprint, and nothing else. This is the way to use a self-signed
+  certificate on a home server without switching checks off: names and expiry
+  dates are not looked at, but no other certificate — and nobody who does not
+  hold that server's key — gets in. Colons, spaces and case in the fingerprint
+  do not matter.
+- **Don't verify** — accepts any certificate. The connection is still
+  encrypted, but anyone in the path can present a certificate of their own,
+  pose as the server and read your password. Use it to get going, not to stay.
+
+**TEST** tries the settings as they are in the dialog, applied or not: it
+connects, logs in, and in each upload directory writes and deletes a small file
+(`sdroxide-test.txt`) — the same rights an upload needs, without touching any
+picture. The answer shows the server's certificate fingerprint whenever the
+connection got that far, even if the certificate was refused. **Trust this
+certificate** then pins it in one click. Compare it with the server first (for
+example `openssl x509 -in cert.pem -noout -fingerprint -sha256` on the server):
+the button pins what the server *said*, which is only proof of identity if you
+have checked it. Then **APPLY**.
+
+Below the buttons, **Last upload** says how the most recent picture went. When
+uploads start failing, sdroxide also says so in the status line — once every ten
+minutes at most, so a server that is down does not repeat it with every picture.
+
 
 ### 6.8 Winlink: radio email account
 
@@ -12407,6 +12888,11 @@ decode, and transmit audio to put on the air. It is **on by default**.
   radio, and the last command wins.
 - **Allow clients to transmit** — turn this off to let programs read and tune
   but never key the transmitter.
+- **TCI Client** — dial out to another TCI server and send this radio's VFO
+  whenever you tune. Control only: no audio, no IQ, and it does not key the
+  transmitter. Off by default. The address is `127.0.0.1:50001`, which is
+  where 590Ctrl listens. Leave the server above off, or on another port, when
+  590Ctrl is already using 50001.
 
 The green status line shows whether the server is listening, on which address,
 and **how many clients are connected right now**. Press **APPLY** to save and
@@ -12899,7 +13385,7 @@ What a profile holds:
   its own is told which one before it is retuned.
 - **The receiver and transmitter levels** — AF volume and mute, RF gain, AGC,
   squelch, noise reduction, binaural, drive, tune drive, mic gain, CESSB and the
-  transmit EQ, and the repeater settings.
+  transmit audio chain, and the repeater settings.
 - **The antennas and gain stages**, including the antenna kept per band — applied
   the same way a restart restores them, so a port or a stage the radio does not
   have is skipped rather than refused.
@@ -14881,7 +15367,7 @@ and not the station's.
 | `qso_log.json` | JSON | The logbook (digital and manual QSOs, with contest/QSL fields). |
 | `net.json` | JSON | Network cockpit: DX cluster / POTA / SOTA / PSK / FreeDV Reporter / WSPRnet feed settings, and callsign-lookup / eQSL / QRZ / HamQTH / Club Log / LoTW credentials (stored in plaintext). |
 | `winlink/` | directory | The Winlink mailbox: `inbox/`, `outbox/`, `sent/` and `archive/`, one `.b2f` file per message holding it exactly as it rides the wire ([§11](#11-winlink-radio-email)). The account settings live in `net.json`, password included, in plaintext. |
-| `tciserver.json` | JSON | Built-in TCI server: enabled, bind address, port, advertised device name, whether clients may transmit, and the client limit. |
+| `tciserver.json` | JSON | Built-in TCI server: enabled, bind address, port, advertised device name, whether clients may transmit, and the client limit. Also the outbound TCI Client: whether it dials another TCI server (590Ctrl) and that server's `host:port`. The client sends the VFO only. |
 | `rigctld.json` | JSON | Built-in Hamlib rigctld server: enabled, bind address, port, reported rig name, whether clients may transmit, and the client limit. |
 | `wsjtx.json` | JSON | WSJT-X UDP broadcast: enabled, destination host and port, and the name clients see. |
 | `scanner.json` | JSON | The scanner: memories or a range, the range and channel step, the level that counts as busy, the dwell, how it resumes, and which memories to skip. |
@@ -16316,6 +16802,7 @@ using. Bind them under **Speech** on the Controls tab:
 | FST4 | The slow weak-signal mode for EME, troposcatter and LF/MF, at a chosen 15/30/60/120/300-second period, with FT8's 77-bit message. Receive only. See [3.23](#323-fst4). |
 | Q65 | WSJT-X's modern weak-signal mode for EME and scatter paths: ten sub-modes (period and tone spacing), FT8's 77-bit message and a CRC. Receive only. See [3.24](#324-q65). |
 | FSK441 | The original meteor-scatter mode on 6 m and 2 m: 4-FSK at 441 baud carrying free text and the `R26`/`R27`/`RRR`/`73` single-tone shorthand, in a 15/30-second period. The decoder hunts the period for meteor-trail pings; transmit repeats the message for the length of the over. See [3.25](#325-fsk441). |
+| JTTY | **Experimental.** The WSJT-X 3.2 asynchronous RTTY-like text mode: no T/R slots, ~1.888-second frames of 4-GFSK about 125 Hz wide carrying free text or typed contest atoms behind a tail-biting convolutional code. Sends a message once. Checked against the reference encoder, not yet off-air. See [3.26](#326-jtty). |
 | PSK | PSK31 keyboard mode (BPSK31 / varicode). |
 | RTTY | RTTY keyboard mode (Baudot; selectable shift and baud), on a sideband. |
 | RTTY-FM | The same modem on an FM carrier, the way a club bulletin is still sent on VHF. |

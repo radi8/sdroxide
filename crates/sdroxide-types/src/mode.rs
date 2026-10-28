@@ -362,6 +362,16 @@ pub enum Mode {
     /// message repeats for the length of the over. Appended for the same reason
     /// as [`Mode::Hell`].
     Fsk441,
+    /// JTTY — the WSJT-X 3.2 RTTY-like **asynchronous** text mode.
+    ///
+    /// Not slotted: a transmission can start at any instant, so
+    /// [`Mode::slot_timing`] answers `None` and the receiver keeps a rolling
+    /// audio window rather than a slot buffer. Each ~1.888 s frame carries a
+    /// short text or typed contest atom (calls, serials, grids, control
+    /// phrases) over a narrow (≈127 Hz) 4-GFSK signal with a tail-biting
+    /// convolutional code, so it copies where 45.45-baud RTTY goes marginal.
+    /// Appended for the same reason as [`Mode::Hell`].
+    Jtty,
 }
 
 /// The bands on which a mode that keeps phone practice rides the lower
@@ -382,7 +392,7 @@ const PHONE_LSB_BANDS: [(f64, f64); 3] =
 impl Mode {
     /// Every mode, in the order they cycle and appear in the picker — which is
     /// deliberately *not* the enum's declaration order (see [`Mode::Hell`]).
-    pub const ALL: [Mode; 49] = [
+    pub const ALL: [Mode; 50] = [
         Mode::Lsb,
         Mode::Usb,
         Mode::Cw,
@@ -432,6 +442,7 @@ impl Mode {
         Mode::Fst4,
         Mode::Q65,
         Mode::Fsk441,
+        Mode::Jtty,
     ];
 
     /// The digital modes handled by a dedicated decode/encode engine (the
@@ -439,7 +450,7 @@ impl Mode {
     /// packet, RF Paint). All are USB underneath except RIFP, VHF packet and
     /// VHF SSTV, which frequency-modulate the carrier, and ACARS, which is
     /// received in AM.
-    pub const DIGITAL: [Mode; 31] = [
+    pub const DIGITAL: [Mode; 32] = [
         Mode::Ft8,
         Mode::Ft4,
         Mode::Ft2,
@@ -452,6 +463,7 @@ impl Mode {
         Mode::Fst4,
         Mode::Q65,
         Mode::Fsk441,
+        Mode::Jtty,
         Mode::Psk,
         Mode::Rtty,
         Mode::RttyFm,
@@ -508,6 +520,7 @@ impl Mode {
                 | Mode::Fst4
                 | Mode::Q65
                 | Mode::Fsk441
+                | Mode::Jtty
         )
     }
 
@@ -719,7 +732,7 @@ impl Mode {
     /// Used by the transmit lockout, which needs to know how far above the
     /// carrier the emission actually reaches. The figures are tones times tone
     /// spacing: FT8 is 8 × 6.25, FT4 is 4 × 20.833, FT2 is 4 × 41.667 (see
-    /// `Ft2::TONE_SPACING_HZ`), WSPR is 4 × 1.4648.
+    /// `Ft2::TONE_SPACING_HZ`), WSPR is 4 × 1.4648, JTTY is 4 × 31.25.
     ///
     /// JS8 is given its WIDEST speed, Turbo's 160 Hz, because a `Mode` does not
     /// know which speed is set — [`crate::Js8Speed::bandwidth_hz`] does, and is
@@ -733,6 +746,7 @@ impl Mode {
             Mode::Ft2 => Some(166.7),
             Mode::Js8 => Some(crate::Js8Speed::Turbo.bandwidth_hz()),
             Mode::Wspr => Some(6.0),
+            Mode::Jtty => Some(125.0),
             _ => None,
         }
     }
@@ -960,6 +974,7 @@ impl Mode {
             Mode::Fst4 => "FST4",
             Mode::Q65 => "Q65",
             Mode::Fsk441 => "FSK441",
+            Mode::Jtty => "JTTY",
         }
     }
 
@@ -1023,6 +1038,7 @@ impl Mode {
                 | Mode::Fst4
                 | Mode::Q65
                 | Mode::Fsk441
+                | Mode::Jtty
         );
         crate::ModeProfile {
             agc: Some(if weak_digi { AgcMode::Slow } else { AgcMode::Med }),
@@ -1112,7 +1128,8 @@ impl Mode {
             | Mode::Fsq
             | Mode::Hell
             | Mode::RfPaint
-            | Mode::Fsk441 => (100.0, 3300.0),
+            | Mode::Fsk441
+            | Mode::Jtty => (100.0, 3300.0),
             // The fax subcarrier is 1900 Hz ± 400; the wider passband leaves
             // room for a receiver tuned a few hundred hertz off, which is the
             // normal state of affairs on a chart found by ear.
@@ -1358,7 +1375,8 @@ impl Mode {
             | Mode::Jt9
             | Mode::Fst4
             | Mode::Q65
-            | Mode::Fsk441 => C::Data,
+            | Mode::Fsk441
+            | Mode::Jtty => C::Data,
         }
     }
 
@@ -1598,7 +1616,8 @@ impl Mode {
             | Mode::Jt9
             | Mode::Fst4
             | Mode::Q65
-            | Mode::Fsk441 => &[],
+            | Mode::Fsk441
+            | Mode::Jtty => &[],
         }
     }
 }
@@ -2044,6 +2063,15 @@ impl AgcMode {
         }
     }
 
+    /// [`Self::next`], passing over `Off` where it is not on offer — see
+    /// `DeviceCaps::agc_off_unavailable`.
+    pub fn next_offered(self, offer_off: bool) -> AgcMode {
+        match self.next() {
+            AgcMode::Off if !offer_off => AgcMode::Off.next(),
+            next => next,
+        }
+    }
+
     /// Hang time in milliseconds; `None` means AGC disabled.
     pub fn hang_ms(self) -> Option<f32> {
         match self {
@@ -2058,6 +2086,26 @@ impl AgcMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A radio whose AGC cannot be switched off is walked through its three
+    /// presets only; everywhere else the cycle is the full four.
+    #[test]
+    fn the_agc_cycle_passes_over_off_only_where_it_is_not_on_offer() {
+        let walk = |offer_off| {
+            let mut agc = AgcMode::Fast;
+            (0..4)
+                .map(|_| {
+                    agc = agc.next_offered(offer_off);
+                    agc
+                })
+                .collect::<Vec<_>>()
+        };
+        use AgcMode::*;
+        assert_eq!(walk(true), [Off, Slow, Med, Fast]);
+        assert_eq!(walk(false), [Slow, Med, Fast, Slow]);
+        // An Off already set still leaves for a real preset.
+        assert_eq!(Off.next_offered(false), Slow);
+    }
 
     /// A mode whose passband is a channel about the carrier must have nothing
     /// but symmetric presets, and a mode with an asymmetric preset must not
@@ -2143,6 +2191,7 @@ mod tests {
             (Mode::Fst4, 46),
             (Mode::Q65, 47),
             (Mode::Fsk441, 48),
+            (Mode::Jtty, 49),
         ];
         for (mode, index) in pinned {
             assert_eq!(mode as u8, index, "{} moved", mode.label());
@@ -2189,12 +2238,31 @@ mod tests {
         // dropped and nothing listed twice.
         // The last variant *by discriminant*, which is the one appended most
         // recently — not the one that reads last in the picker.
-        let last = Mode::Fsk441 as u8;
+        let last = Mode::Jtty as u8;
         for i in 0..=last {
             let present = Mode::ALL.iter().filter(|m| **m as u8 == i).count();
             assert_eq!(present, 1, "discriminant {i} appears {present} times in Mode::ALL");
         }
         assert_eq!(Mode::ALL.len(), last as usize + 1);
+    }
+
+    /// Every mode offered in the band/mode menu's **Digital** row must be a
+    /// digital mode, and every digital mode must be offerable — the menu
+    /// iterates `Mode::DIGITAL`, not `Mode::ALL`, so a new mode left out of
+    /// `DIGITAL` is simply invisible there even though it cycles and parses.
+    #[test]
+    fn the_digital_menu_row_lists_every_digital_mode() {
+        for m in Mode::DIGITAL {
+            assert!(m.is_digital(), "{m:?} is in the Digital menu row but is not digital");
+        }
+        for m in Mode::ALL {
+            if m.is_digital() {
+                assert!(
+                    Mode::DIGITAL.contains(&m),
+                    "{m:?} is digital but missing from the Digital menu row"
+                );
+            }
+        }
     }
 
     /// RTTY on an FM carrier is the same modem on a different radio, and every

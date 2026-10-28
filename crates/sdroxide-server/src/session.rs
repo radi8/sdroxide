@@ -189,6 +189,7 @@ async fn run_session(
         drm,
         hd,
         relay,
+        amp,
         profiles,
         tuner_status,
         tuner_presence,
@@ -218,6 +219,7 @@ async fn run_session(
             latest.drm.clone(),
             latest.hd.clone(),
             latest.relay.clone(),
+            latest.amp.clone(),
             latest.profiles.clone(),
             latest.tuner_status,
             latest.tuner_presence,
@@ -324,6 +326,9 @@ async fn run_session(
     // needs to know about *before* it touches the PTT button.
     if let Some(r) = relay {
         let _ = socket.send(msg(&ServerMsg::RelayStatus(r))).await;
+    }
+    if let Some(a) = amp {
+        let _ = socket.send(msg(&ServerMsg::AmpStatus(a))).await;
     }
     // A standing condition rather than an event: whoever attaches next has to
     // know the radio is refusing tunes or reconnecting, not just whoever

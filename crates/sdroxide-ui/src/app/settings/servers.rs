@@ -21,6 +21,10 @@ pub(in crate::app) struct TciServerStatus {
     pub(in crate::app) addr: String,
     pub(in crate::app) clients: usize,
     pub(in crate::app) error: Option<String>,
+    /// Outbound TCI client socket. The rigctld tab reuses this struct and
+    /// leaves both of these at rest.
+    pub(in crate::app) client_connected: bool,
+    pub(in crate::app) client_error: Option<String>,
 }
 
 pub(in crate::app) fn settings_wsjtx_tab(
@@ -557,6 +561,64 @@ pub(in crate::app) fn settings_tci_server_tab(
         }
     }
 
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(RichText::new("TCI Client").size(14.0).strong().color(crate::theme::CYAN()));
+    ui.add_space(6.0);
+    crate::chrome::checkbox(ui, &mut cfg.client, "TCI Client").on_hover_text(
+        "When you tune, send this radio's VFO to another TCI server so that rig tunes along. \
+         Control only — no audio, no IQ, and it does not key the transmitter.",
+    );
+    ui.add_space(6.0);
+    ui.add_enabled_ui(cfg.client, |ui| {
+        egui::Grid::new("tci-client-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            ui.label("Server");
+            crate::chrome::field(
+                ui,
+                egui::TextEdit::singleline(&mut cfg.client_address)
+                    .desired_width(180.0)
+                    .hint_text("127.0.0.1:50001"),
+            );
+            ui.end_row();
+        });
+    });
+    if cfg.client && cfg.client_reaches_this_server() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "This is the same address as the server above. The client connects only when \
+                 that server is not the one listening — leave it off, or on another port, when \
+                 590Ctrl is using this port.",
+            )
+            .color(Color32::from_rgb(230, 170, 60)),
+        );
+    }
+    if cfg.client {
+        ui.add_space(6.0);
+        match status {
+            Some(s) if s.client_connected => {
+                ui.label(
+                    RichText::new("● TCI Client connected").color(Color32::from_rgb(90, 200, 110)),
+                );
+            }
+            Some(s) => match &s.client_error {
+                Some(e) => {
+                    ui.label(
+                        RichText::new(format!("TCI Client: {e}"))
+                            .color(Color32::from_rgb(230, 90, 80)),
+                    );
+                }
+                None => {
+                    ui.label(RichText::new("TCI Client connecting…").weak());
+                }
+            },
+            None => {
+                ui.label(RichText::new("TCI Client — press APPLY.").weak());
+            }
+        }
+    }
+
     ui.add_space(8.0);
     if crate::chrome::chip_accent(
         ui,
@@ -565,7 +627,7 @@ pub(in crate::app) fn settings_tci_server_tab(
         crate::theme::GREEN(),
         crate::theme::INK_ON_CYAN(),
     )
-    .on_hover_text("Persist and (re)bind the server")
+    .on_hover_text("Persist and (re)bind the server, and connect the TCI client")
     .clicked()
     {
         *apply = true;
@@ -574,9 +636,11 @@ pub(in crate::app) fn settings_tci_server_tab(
     ui.add_space(8.0);
     ui.label(
         RichText::new(
-            "Lets TCI-capable programs drive this radio: frequency and mode control, wideband IQ, \
-             receive audio, and transmit audio. In WSJT-X choose the SunSDR (TCI) rig type, point \
-             it at this address, and set PTT to TCI.",
+            "The server lets TCI-capable programs drive this radio: frequency and mode control, \
+             wideband IQ, receive audio, and transmit audio. In WSJT-X choose the SunSDR (TCI) \
+             rig type, point it at this address, and set PTT to TCI. TCI Client is the other \
+             direction: sdroxide's dial is sent as a VFO command to 590Ctrl (or any TCI server) \
+             at the address above. It does not pass audio.",
         )
         .weak(),
     );

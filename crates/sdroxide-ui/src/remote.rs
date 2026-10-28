@@ -369,6 +369,7 @@ impl RemoteController {
             ServerMsg::MemoryFolders(f) => self.pending.push_back(RadioEvent::MemoryFolders(f)),
             ServerMsg::Scanner(c) => self.pending.push_back(RadioEvent::Scanner(c)),
             ServerMsg::Profiles(p) => self.pending.push_back(RadioEvent::Profiles(p)),
+            ServerMsg::PictureUpload(st) => self.pending.push_back(RadioEvent::PictureUpload(st)),
             // Dropped rather than decoded while another tab holds the page's
             // single output: the work saved is the point on a browser tab
             // holding several radios.
@@ -469,9 +470,21 @@ impl RemoteController {
             ServerMsg::RigctldStatus { running, addr, clients, error } => {
                 self.pending.push_back(RadioEvent::RigctldStatus { running, addr, clients, error })
             }
-            ServerMsg::TciServerStatus { running, addr, clients, error } => self
-                .pending
-                .push_back(RadioEvent::TciServerStatus { running, addr, clients, error }),
+            ServerMsg::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            } => self.pending.push_back(RadioEvent::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            }),
             ServerMsg::ImagePresets(p) => self.pending.push_back(RadioEvent::ImagePresets(p)),
             ServerMsg::ImageSlotSource { slot, version, png } => {
                 self.pending.push_back(RadioEvent::ImageSlotSource { slot, version, png })
@@ -499,6 +512,7 @@ impl RemoteController {
                 .pending
                 .push_back(RadioEvent::RotatorStatus { connected, az_deg, el_deg, error }),
             ServerMsg::RelayStatus(st) => self.pending.push_back(RadioEvent::RelayStatus(st)),
+            ServerMsg::AmpStatus(st) => self.pending.push_back(RadioEvent::AmpStatus(st)),
             ServerMsg::RadioConfig(c) => {
                 // Adopted only when nothing of ours is waiting to go out. This
                 // message is usually the echo of our own write, but it can

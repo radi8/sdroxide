@@ -138,6 +138,7 @@ sdroxide-lime = { path = "crates/sdroxide-lime" }
 sdroxide-limerfe = { path = "crates/sdroxide-limerfe" }
 sdroxide-fobos = { path = "crates/sdroxide-fobos" }
 sdroxide-relay = { path = "crates/sdroxide-relay" }
+sdroxide-hardrock = { path = "crates/sdroxide-hardrock" }
 sdroxide-spyserver = { path = "crates/sdroxide-spyserver" }
 sdroxide-kiwisdr = { path = "crates/sdroxide-kiwisdr" }
 sdroxide-net = { path = "crates/sdroxide-net" }

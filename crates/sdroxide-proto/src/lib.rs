@@ -1546,7 +1546,70 @@ use sdroxide_types::{
 /// ([`sdroxide_types::RotatorProtocol`], a unit enum) on its tail — rotctld or
 /// PSTRotator's UDP control (issue #638). It rides `Command::SetRotatorConfig`
 /// and `StationConfig::rotator` whole, so a v178 peer reads it out of step.
-pub const PROTO_VERSION: u16 = 180;
+///
+/// v180: the TCI client. [`sdroxide_types::TciServerConfig`] gains `client`
+/// and `client_address` on its tail — dial out and push this radio's VFO to
+/// another TCI server, control only. It rides `Command::SetTciServerConfig`
+/// and `StationConfig::tci_server` whole, so a v179 peer reads the extra
+/// bytes as the start of the next field. [`ServerMsg::TciServerStatus`] also
+/// gains `client_connected` and `client_error`, the same break for that one
+/// message.
+/// v181: [`sdroxide_types::DeviceCaps`] gains `agc_off_unavailable` (`bool`)
+/// on its tail — the AGC control drives a radio whose AGC has no Off, so the
+/// client stops offering it. `DeviceCaps` rides every capabilities message, so
+/// a v180 peer reads the extra byte out of step.
+/// v182: received pictures to an FTP/FTPS server. `StationConfig` gains
+/// `picture_upload` (`PictureUploadConfig`) on its tail, `Command` gains
+/// `SetPictureUploadConfig` and `TestPictureUpload`, and `ServerMsg` gains
+/// `PictureUpload` — the outcome of an upload or of a test, which a remote
+/// screen needs because the station, not the screen, is what connects.
+/// `StationConfig` rides whole, so a v181 peer fails to decode it.
+/// v183: the transmit voice chain. `TxState::eq` became `TxState::voice`
+/// ([`sdroxide_types::TxVoiceState`]: gate, EQ, de-esser, compressor, output),
+/// with the EQ itself gaining a high-pass, a second peak and a low-pass, and
+/// `TxState` gaining `voice_test` and `voice_test_len_s`. `Command::SetTxEq`
+/// became `Command::SetTxVoice` in the same position, carrying the whole
+/// chain; `Command::TxVoiceTestRecord`, `Command::TxVoiceTestPlay` and
+/// `Command::TxVoiceTestLive` are appended. `Meters` gains `voice` on its tail. Every state broadcast and
+/// every meter frame changes layout, so both ends have to agree.
+/// v184: Wavelog, the operator's own web logbook, as a logging service built
+/// in rather than reached through WaveLogGate. All of it appended, none of it
+/// separable — a v183 peer handed any one of these reads the tail of the
+/// message carrying it out of step.
+///
+/// * [`sdroxide_types::NetworkConfig`] gains `wavelog`
+///   ([`sdroxide_types::WavelogConfig`]: address, key, pinned certificate,
+///   default station location, auto-upload, which locations to download and
+///   how often, and the live radio status). It rides whole inside
+///   `Command::SetNetworkConfig`.
+/// * [`sdroxide_types::DigiConfig`] gains `wavelog_station_id` on its tail —
+///   the location is part of the operating identity, since Wavelog refuses a
+///   QSO whose station callsign is not the location's. It rides
+///   `Command::SetDigiConfig` and `DigiStatus` whole.
+/// * [`sdroxide_types::QsoRecord`] gains `wavelog_sent` and `wavelog_origin`
+///   (the location a downloaded contact came from), and
+///   [`sdroxide_types::UploadResult`] gains `retryable`, which drives the
+///   Wavelog retry queue. Both ride inside `RadioEvent`s that cross the link.
+/// * `UploadTarget` and `LoginTarget` each gain `Wavelog`, appended, so no
+///   surviving discriminant moved — but a v183 peer handed one has nowhere to
+///   put it.
+/// * [`sdroxide_types::Command`] gains `WavelogSync`, appended. Its answers,
+///   `RadioEvent::WavelogBatch` and `RadioEvent::WavelogProbe`, stay on the
+///   machine the engine runs on and have no `ServerMsg`.
+///
+/// v185: the Hardrock amplifier. `Command` gains `SetAmpConfig`, `Amp` and
+/// `SetRigPowerStep`, `ServerMsg` gains `AmpStatus`, `StationConfig` gains
+/// `amp` on its tail, and `AmpAlerts` carries `from_amp`, for the amplifier's
+/// own lights — all appended, so a v184 peer reads them out of step.
+///
+/// v186: JTTY, the WSJT-X 3.2 asynchronous RTTY-like text mode. `Mode::Jtty`
+/// is appended to that enum, so no surviving discriminant moves, and
+/// `DigiStatus` gains `jtty` (`Option<JttyStatus>`) on its tail — the messages
+/// decoded and the smoothed audio level. `DigiStatus` rides `RadioState` whole,
+/// so a v185 peer reads the extra bytes as the start of the next field and
+/// fails to decode every digital status, the same break as every appended field
+/// before it.
+pub const PROTO_VERSION: u16 = 186;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1757,6 +1820,10 @@ pub enum ServerMsg {
         addr: String,
         clients: usize,
         error: Option<String>,
+        /// Outbound TCI client socket is up. See [`sdroxide_types::TciServerConfig::client`].
+        client_connected: bool,
+        /// Why that client is down. `None` when it is off, connecting, or up.
+        client_error: Option<String>,
     },
     /// Built-in rigctld server status, so the settings dialog on a remote
     /// client can show what the engine's listener is doing.
@@ -2005,6 +2072,19 @@ pub enum ServerMsg {
     ///
     /// Appended last, for the usual reason.
     Pi4Spots(Vec<sdroxide_types::Pi4Spot>),
+    /// `RadioEvent::PictureUpload`: how a received-picture FTP upload, or a
+    /// test of its settings, went. Forwarded, unlike `LoginTest`: the settings
+    /// are edited from whichever screen, but only the station connects, so a
+    /// remote screen has no other way to learn whether they work. It names
+    /// the server and the certificate it presented, nothing of the account.
+    ///
+    /// Appended last, for the usual reason.
+    PictureUpload(sdroxide_types::PictureUploadStatus),
+    /// `RadioEvent::AmpStatus`: the Hardrock amplifier's readings, tuner and
+    /// link state. Replayed on connect for the T/R switch's reason.
+    ///
+    /// Appended last, for the usual reason.
+    AmpStatus(Box<sdroxide_types::AmpStatus>),
     /// `RadioEvent::TunerStatus`: latest verified AH-4 tuner status.
     /// Appended last, for the usual reason.
     TunerStatus(Option<u8>),
@@ -2086,6 +2166,38 @@ mod tests {
         assert_eq!(back, m);
 
         let m = ServerMsg::Profiles(vec!["Contest".into(), "DX".into()]);
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+
+        // The picture upload: both commands, the answer, and the settings
+        // riding the station bundle's tail.
+        let cfg = sdroxide_types::PictureUploadConfig {
+            enabled: true,
+            host: "ftp.example.org".into(),
+            verify: sdroxide_types::TlsVerify::Pinned,
+            pinned_sha256: "ab".repeat(32),
+            ..Default::default()
+        };
+        for c in [
+            ClientMsg::Command(Command::SetPictureUploadConfig(Box::new(cfg.clone()))),
+            ClientMsg::Command(Command::TestPictureUpload(Box::new(cfg.clone()))),
+        ] {
+            let back: ClientMsg = decode(&encode(&c).unwrap()).unwrap();
+            assert_eq!(back, c);
+        }
+        let m = ServerMsg::PictureUpload(sdroxide_types::PictureUploadStatus {
+            ok: false,
+            message: "login: 530".into(),
+            unix: 1_700_000_000,
+            fingerprint: Some("cd".repeat(32)),
+            is_test: true,
+        });
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let m = ServerMsg::StationConfig(Box::new(sdroxide_types::StationConfig {
+            picture_upload: cfg,
+            ..Default::default()
+        }));
         let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
         assert_eq!(back, m);
 

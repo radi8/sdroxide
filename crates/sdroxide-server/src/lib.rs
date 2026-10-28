@@ -229,6 +229,9 @@ pub(crate) struct Latest {
     /// answering, and "nothing has changed since you attached" must not read as
     /// "nothing is wrong".
     pub relay: Option<Box<sdroxide_types::RelayStatus>>,
+    /// The amplifier, replayed on connect for the relay's reason: a remote
+    /// operator has to know whether it is in line before they key.
+    pub amp: Option<Box<sdroxide_types::AmpStatus>>,
     /// What the RDS decoder has made of the station currently tuned. Replayed on
     /// connect for the same reason as `digi` and `voice`: which station is being
     /// listened to is a standing condition, and a client that attaches after the
@@ -1172,9 +1175,21 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::RigctldStatus { running, addr, clients, error } => {
                 Some(ServerMsg::RigctldStatus { running, addr, clients, error })
             }
-            RadioEvent::TciServerStatus { running, addr, clients, error } => {
-                Some(ServerMsg::TciServerStatus { running, addr, clients, error })
-            }
+            RadioEvent::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            } => Some(ServerMsg::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            }),
             RadioEvent::ImagePresets(p) => {
                 latest.images = Some(p.clone());
                 Some(ServerMsg::ImagePresets(p))
@@ -1237,6 +1252,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 latest.relay = Some(st.clone());
                 Some(ServerMsg::RelayStatus(st))
             }
+            RadioEvent::AmpStatus(st) => {
+                latest.amp = Some(st.clone());
+                Some(ServerMsg::AmpStatus(st))
+            }
             // Handled above, and deliberately not forwarded: the skimmer
             // firehose is a hundred times the spot list's traffic, and the
             // solar relay already carries what it adds up to. See
@@ -1248,6 +1267,9 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             // client's, and it is only ever asked for from the machine the
             // credentials live on. Same treatment as `RadioEvent::Notice`.
             RadioEvent::LoginTest(_) => None,
+            // The rest of the same answer, kept local for the same reason.
+            RadioEvent::WavelogProbe(_) => None,
+            RadioEvent::WavelogBatch(_) => None,
             RadioEvent::Profiles(p) => {
                 latest.profiles = p.clone();
                 Some(ServerMsg::Profiles(p))
@@ -1264,6 +1286,9 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 latest.ah4_busy = busy;
                 Some(ServerMsg::Ah4Busy(busy))
             }
+            // Not cached: it is an answer to a test or news of one upload, and
+            // a screen attaching later has asked nothing.
+            RadioEvent::PictureUpload(st) => Some(ServerMsg::PictureUpload(st)),
         }
     };
     // The satellite half of the station config also drives this machine's own

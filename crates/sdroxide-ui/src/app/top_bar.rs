@@ -23,7 +23,7 @@
 
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, Slider};
 use sdroxide_types::{
-    AgcMode, BURST_MS_RANGE, Band, Command, CwEngine, DCS_CODES, DIV_FREEZE_ELEMENT,
+    AgcMode, AmpLevel, BURST_MS_RANGE, Band, Command, CwEngine, DCS_CODES, DIV_FREEZE_ELEMENT,
     DIV_MODE_ELEMENT, DIV_RATE_ELEMENT, DIV_RESET_ELEMENT, DeviceCaps, Direction, DiversityMode,
     GainElement, GainUnit, MAX_OFFSET_HZ, Mode, NrEngine, NrLevel, NrStrength, RadioState, RxId,
     Shift, SkimmerKind, SpectrumDetail, Speed, SubTone, ToneMode, Vfo,
@@ -770,7 +770,7 @@ impl SdroxideApp {
         }
         let w = self.display_rows_w(ui);
         boxes.push((Kind::Display, StripBox { w, flex: 1.0, max_w: w * CHIP_STRETCH_FACTOR }));
-        let w = system_rows_w(ui);
+        let w = system_rows_w(ui, self.has_amp());
         boxes.push((Kind::System, StripBox { w, flex: 1.0, max_w: w * CHIP_STRETCH_FACTOR }));
 
         // A whole row is worth more than digit size: when the strip packs into
@@ -2729,11 +2729,20 @@ impl SdroxideApp {
             // (Mode::audio_agc) and the chip would do nothing.
             if self.state.rx[0].mode.audio_agc() {
                 let agc = self.state.rx[0].agc;
+                // The radio's AGC, where it is the one heard and has no Off to
+                // be told: the chip walks its three presets and nothing else.
+                let offer_off = !self.caps.as_ref().is_some_and(|c| c.agc_off_unavailable);
+                let hover = if offer_off {
+                    "AGC hang time — click to cycle: Off / Slow / Med / Fast"
+                } else {
+                    "The radio's own AGC — click to cycle: Slow / Med / Fast. \
+                     It cannot be switched off from here."
+                };
                 if crate::chrome::chip(ui, agc != AgcMode::Off, format!("AGC {}", agc.label()))
-                    .on_hover_text("AGC hang time — click to cycle: Off / Slow / Med / Fast")
+                    .on_hover_text(hover)
                     .clicked()
                 {
-                    cmds.push(Command::SetAgc { rx: RxId::Main, agc: agc.next() });
+                    cmds.push(Command::SetAgc { rx: RxId::Main, agc: agc.next_offered(offer_off) });
                 }
                 // With the AGC off the audio rides on this fixed gain instead.
                 // It has to be here: unlevelled, the demodulator's output is
@@ -4544,6 +4553,107 @@ impl SdroxideApp {
         }
     }
 
+    /// Read the radio's settings if nothing has yet, where the connected radio
+    /// could be an FDM-DUO: [`Self::duo_presets_apply`] needs them, and they
+    /// are otherwise read only when Settings or the DIV box first asks. Without
+    /// this the power buttons, and the AMP panel's "never borrow DRV" rule,
+    /// were missing after a restart until Settings was opened (AJ3G, 18 Oct
+    /// 2026). Once read it is never `None` again; on a
+    /// remote client it is the replayed copy.
+    pub(in crate::app) fn load_radio_cfg_for_duo(&mut self) {
+        if self.radio_cfg.is_some() {
+            return;
+        }
+        let maybe_duo = self.caps.as_ref().is_some_and(|c| {
+            c.tx_channels > 0
+                && (c.driver == "elad"
+                    || (c.driver == "cat"
+                        && c.label == format!("{} (CAT)", sdroxide_types::CatFamily::Elad.label())))
+        });
+        if maybe_duo {
+            self.radio_cfg = self.ctrl.radio_config();
+        }
+    }
+
+    /// Whether the TX box carries the 1W / 3W / 5W / MAX buttons: an ELAD
+    /// FDM-DUO that can transmit with a Rig control (CAT) port set — over the
+    /// ELAD backend with its serial port, or as a CAT rig of the ELAD family —
+    /// and no other radio (AJ3G, 18 Oct 2026: "that setting should only appear
+    /// for ELAD Users", and "only when ELAD TX is enabled in CAT/Rig Control").
+    /// An FDM-S2 has no transmitter, so `tx_channels` is 0 and it never sees
+    /// them.
+    pub(in crate::app) fn duo_presets_apply(&self) -> bool {
+        let Some(c) = self.caps.as_ref() else { return false };
+        if c.tx_channels == 0 {
+            return false;
+        }
+        let serial = self.radio_cfg.as_ref().is_some_and(|r| !r.cat.serial.path.is_empty());
+        (c.driver == "elad" && serial)
+            || (c.driver == "cat"
+                && c.label == format!("{} (CAT)", sdroxide_types::CatFamily::Elad.label()))
+    }
+
+    /// What the presets column costs beside the TX rows, its gap included; 0
+    /// where it is not drawn.
+    fn tx_duo_col_w(&self, ui: &egui::Ui) -> f32 {
+        if !self.duo_presets_apply() {
+            return 0.0;
+        }
+        let labels: Vec<&str> = super::duo_power::PRESETS.iter().map(|&(l, _)| l).collect();
+        let caption = crate::chrome::text_width(
+            ui,
+            &DUO_PRESETS_CAPTION.to_uppercase(),
+            egui::FontId::proportional(9.5),
+        );
+        MODULE_ROW_SPACING + chip_row_w(ui, &labels).max(caption)
+    }
+
+    /// The FDM-DUO's power buttons, captioned underneath so an operator can
+    /// tell they are the radio's own and not the amplifier's. Each puts the
+    /// DUO's menu 34 on that setting now and saves it, so it is sent again at
+    /// every connect; see [`super::duo_power`].
+    fn tx_duo_presets(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let current = self.radio_cfg.as_ref().map(|r| r.cat.elad_tx_power);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, 2.0);
+            let row = ui.horizontal(|ui| {
+                for &(label, code) in &super::duo_power::PRESETS {
+                    let lit = current == Some(code);
+                    let resp = crate::chrome::chip(ui, lit, label)
+                        .on_hover_text(super::duo_power::hover(code));
+                    if resp.clicked()
+                        && !lit
+                        && let Some(cfg) = self.radio_cfg.as_mut()
+                    {
+                        cfg.cat.elad_tx_power = code;
+                        cmds.push(Command::SetRadioConfig {
+                            cfg: Box::new(cfg.clone()),
+                            reopen: false,
+                        });
+                        cmds.push(Command::SetRigPowerStep(code));
+                    }
+                }
+            });
+            // In the chips' own ink and centred under the row, so it reads as
+            // the name of the four buttons rather than a separate menu heading.
+            let ink = ui.visuals().widgets.inactive.fg_stroke.color;
+            let w = row.response.rect.width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(w, 0.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.set_min_width(w);
+                    ui.label(
+                        RichText::new(DUO_PRESETS_CAPTION.to_uppercase())
+                            .size(9.5)
+                            .strong()
+                            .color(ink),
+                    );
+                },
+            );
+        });
+    }
+
     /// The tune-carrier level: label + rail + readout.
     fn tx_tune_level(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let mut tune_drive = self.state.tx.tune_drive;
@@ -4561,10 +4671,31 @@ impl SdroxideApp {
         }
     }
 
+    /// The "Mic" caption over or beside the mic-gain rail, which is also the
+    /// way into the TX Audio window — the microphone's processing belongs with
+    /// the microphone's level. Drawn in the accent colour while the chain is
+    /// doing something, so a processed voice never goes out unannounced.
+    ///
+    /// A label that takes clicks rather than a chip, so it costs the TX box
+    /// exactly the width the plain caption did.
+    fn tx_mic_caption(&mut self, ui: &mut egui::Ui, text: RichText) {
+        let active = self.state.tx.voice.active();
+        let text = if active { text.color(crate::theme::CYAN()) } else { text };
+        let hover = if active {
+            "TX Audio is processing the microphone — click to open it"
+        } else {
+            "Click to open TX Audio: gate, EQ, compressor and limiter for the microphone"
+        };
+        if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(hover).clicked()
+        {
+            self.tx_audio.open = !self.tx_audio.open;
+        }
+    }
+
     /// The Mic gain: label + rail, no readout.
     fn tx_mic(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let mut mic = self.state.tx.mic_gain;
-        ui.label("Mic");
+        self.tx_mic_caption(ui, RichText::new("Mic"));
         if crate::chrome::slider(ui, Slider::new(&mut mic, 0.0..=1.0).show_value(false)).changed() {
             cmds.push(Command::SetMicGain(mic));
         }
@@ -4667,7 +4798,7 @@ impl SdroxideApp {
     fn tx_mic_vertical(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(RichText::new("Mic").size(10.5));
+            self.tx_mic_caption(ui, RichText::new("Mic").size(10.5));
             let mut mic = self.state.tx.mic_gain;
             // The rail takes whatever height the label left it.
             ui.spacing_mut().slider_width = (ui.available_height() - 2.0).max(24.0);
@@ -4815,6 +4946,9 @@ impl SdroxideApp {
         crate::chrome::control_row(ui, narrow, |ui| {
             self.tx_keyer_chip(ui);
             self.tx_drive(ui, cmds);
+            if self.duo_presets_apply() {
+                self.tx_duo_presets(ui, cmds);
+            }
             self.tx_tune_level(ui, cmds);
             if mic {
                 self.tx_mic(ui, cmds);
@@ -4835,7 +4969,11 @@ impl SdroxideApp {
     /// The condensed TX box's natural width — [`tx_rows_w_for`] with the
     /// voice keyer's presence read off the current mode.
     fn tx_rows_w(&self, ui: &egui::Ui) -> f32 {
-        tx_rows_w_for(ui, self.state.rx[0].mode.allows_voice_keyer(), self.tx_side_col_w())
+        tx_rows_w_for(
+            ui,
+            self.state.rx[0].mode.allows_voice_keyer(),
+            self.tx_side_col_w() + self.tx_duo_col_w(ui),
+        )
     }
 
     /// What the condensed TX box's right-hand columns cost: the transmit-audio
@@ -4863,7 +5001,8 @@ impl SdroxideApp {
         let keyer = self.state.rx[0].mode.allows_voice_keyer();
         let level = self.digi_tx_level_applies();
         let cessb = self.cessb_applies();
-        let side_w = self.tx_side_col_w();
+        let duo = self.duo_presets_apply();
+        let side_w = self.tx_side_col_w() + self.tx_duo_col_w(ui);
         let (fixed1, fixed2) = tx_rows_fixed_w(ui, keyer);
         let inner = w - 2.0 * crate::chrome::MODULE_MARGIN_X - 4.0;
         let rows_w = inner - TX_MIC_GAP - side_w;
@@ -4884,6 +5023,9 @@ impl SdroxideApp {
                     self.tx_tune_level(ui, cmds);
                 });
             });
+            if duo {
+                self.tx_duo_presets(ui, cmds);
+            }
             // The side rail stands apart from the rows' readouts, so it reads
             // as its own control rather than a fourth element of the rows.
             //
@@ -5700,7 +5842,9 @@ impl SdroxideApp {
 
     /// The remaining window chips — the condensed System box's bottom row.
     fn system_chips_bottom(&mut self, ui: &mut egui::Ui, extra: f32, cmds: &mut Vec<Command>) {
-        let [mail, mem, scan_label, hfdl_label, grid_label, settings, help] = SYSTEM_CHIPS_BOTTOM;
+        let [mail, mem, scan_label, hfdl_label, grid_label, amp_label, settings, help] =
+            SYSTEM_CHIPS_BOTTOM_AMP;
+        let has_amp = self.has_amp();
         if chip_stretched(ui, self.mail.open, mail, extra)
             .on_hover_text("Winlink radio email")
             .clicked()
@@ -5786,6 +5930,55 @@ impl SdroxideApp {
         {
             self.show_grid = !self.show_grid;
         }
+        if has_amp {
+            // Lit while the amplifier is answering and in line, so a glance says
+            // whether the next over goes out at 500 W or barefoot, in the colour
+            // of its worst reading; also lit, in that colour, whenever a reading
+            // is past green; red while an enabled amplifier is not answering.
+            let amp = &self.amp_status;
+            let worst = super::amp::amp_worst(amp);
+            let amp_live = amp.connected && amp.readings.is_some_and(|r| r.ptt);
+            let amp_chip = if let Some(w) = worst.filter(|&w| amp_live || w > AmpLevel::Green) {
+                let fill = match w {
+                    AmpLevel::Green => crate::theme::GREEN(),
+                    AmpLevel::Yellow => crate::theme::YELLOW(),
+                    AmpLevel::Red => crate::theme::ALERT(),
+                };
+                accent_chip_stretched(
+                    ui,
+                    true,
+                    amp_label,
+                    fill,
+                    crate::theme::INK_ON_BRIGHT(),
+                    extra,
+                )
+            } else if amp.configured && !amp.connected && amp.error.is_some() {
+                accent_chip_stretched(
+                    ui,
+                    true,
+                    amp_label,
+                    crate::theme::ALERT(),
+                    crate::theme::INK_ON_BRIGHT(),
+                    extra,
+                )
+            } else {
+                chip_stretched(ui, self.show_amp, amp_label, extra)
+            };
+            if amp_chip
+                .on_hover_text(if !amp.configured {
+                    "Amplifier — set up a Hardrock under Settings → Amplifier".to_string()
+                } else if amp_live {
+                    format!("{} — in line (PTT)", amp.model.label())
+                } else if amp.connected {
+                    format!("{} — bypassed (OFF)", amp.model.label())
+                } else {
+                    format!("{} — not answering", amp.model.label())
+                })
+                .clicked()
+            {
+                self.show_amp = !self.show_amp;
+            }
+        }
         if chip_stretched(ui, self.show_settings, settings, extra)
             .on_hover_text("Settings — device gains, antennas, audio devices")
             .clicked()
@@ -5798,6 +5991,11 @@ impl SdroxideApp {
         {
             self.help.open = !self.help.open;
         }
+    }
+
+    /// Whether the station has an amplifier set up, and so an AMP chip.
+    fn has_amp(&self) -> bool {
+        self.amp_status.configured
     }
 
     /// The window buttons — the body of the SYS menu. See
@@ -5813,7 +6011,8 @@ impl SdroxideApp {
     /// chips splitting its share of the packer's stretch evenly.
     fn windows_condensed(&mut self, ui: &mut egui::Ui, w: f32, cmds: &mut Vec<Command>) {
         let inner = w - 2.0 * crate::chrome::MODULE_MARGIN_X;
-        let (top, bottom): (&[&str], &[&str]) = (&SYSTEM_CHIPS_TOP, &SYSTEM_CHIPS_BOTTOM);
+        let (top, bottom): (&[&str], &[&str]) =
+            (&SYSTEM_CHIPS_TOP, system_chips_bottom_row(self.has_amp()));
         let extra1 = ((inner - chip_row_w(ui, top)) / top.len() as f32).max(0.0);
         let extra2 = ((inner - chip_row_w(ui, bottom)) / bottom.len() as f32).max(0.0);
         crate::chrome::module_bare_h(ui, w, crate::chrome::MODULE_TALL_H, |ui| {
@@ -5931,6 +6130,17 @@ const SYSTEM_CHIPS_TOP: [&str; 7] = ["LOG", "SPOTS", "AWARDS", "BANDS", "SAT", "
 const SYSTEM_CHIPS_BOTTOM: [&str; 7] =
     ["MAIL", "MEM", "SCAN", "HFDL", "GRID", "⚙ SETTINGS", "? HELP"];
 
+/// [`SYSTEM_CHIPS_BOTTOM`] with the amplifier's chip, for a station that has
+/// one. Only then: the strip is packed to the pixel, and a chip nobody can use
+/// is width taken from every station without an amplifier.
+const SYSTEM_CHIPS_BOTTOM_AMP: [&str; 8] =
+    ["MAIL", "MEM", "SCAN", "HFDL", "GRID", "AMP", "⚙ SETTINGS", "? HELP"];
+
+/// The System box's bottom row as it is drawn for this station.
+fn system_chips_bottom_row(has_amp: bool) -> &'static [&'static str] {
+    if has_amp { &SYSTEM_CHIPS_BOTTOM_AMP } else { &SYSTEM_CHIPS_BOTTOM }
+}
+
 /// The Display box's top row: the solar view, then the chips that choose what
 /// the panadapter draws — the last of those only on a front end with a
 /// full-band lane. Peak hold used to stand here too and now lives in SPEC's
@@ -5943,6 +6153,9 @@ pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WID
 /// and the FFT/levels popup. Read by the measurement and by each chip's own
 /// draw site.
 const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
+
+/// The caption under the FDM-DUO's power presets (AJ3G, 18 Oct 2026).
+const DUO_PRESETS_CAPTION: &str = "ELAD FDM-DUO TX PWR";
 
 /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
 /// labels, so the chips match and the level blocks beside them start on the
@@ -6856,8 +7069,8 @@ fn accent_chip_stretched(
 /// wider row plus the box's side margins. Measured against the live style
 /// rather than fixed, because a touched layout pads every chip out past its
 /// desktop width — see `the_condensed_system_box_fits_its_chips`.
-fn system_rows_w(ui: &egui::Ui) -> f32 {
-    chip_row_w(ui, &SYSTEM_CHIPS_TOP).max(chip_row_w(ui, &SYSTEM_CHIPS_BOTTOM))
+fn system_rows_w(ui: &egui::Ui, has_amp: bool) -> f32 {
+    chip_row_w(ui, &SYSTEM_CHIPS_TOP).max(chip_row_w(ui, system_chips_bottom_row(has_amp)))
         + 2.0 * crate::chrome::MODULE_MARGIN_X
 }
 
@@ -7973,12 +8186,12 @@ mod tests {
     /// zero stretch. Hands back the width the box left for its contents, and
     /// how far each chip reached into it, both measured from the box's inner
     /// left edge.
-    fn system_box_and_chips() -> (f32, Vec<(&'static str, f32)>) {
+    fn system_box_and_chips(has_amp: bool) -> (f32, Vec<(&'static str, f32)>) {
         let (ctx, input) = desktop_ctx();
         let mut out = None;
         ctx.run_ui(input, |ui| {
             let mut chips = Vec::new();
-            let width = system_rows_w(ui);
+            let width = system_rows_w(ui, has_amp);
             let room =
                 crate::chrome::module_bare_h(ui, width, crate::chrome::MODULE_TALL_H, |ui| {
                     // Read before the rows are drawn: egui grows a Ui's
@@ -7991,7 +8204,7 @@ mod tests {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.spacing_mut().item_spacing =
                             egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
-                        for row in [&SYSTEM_CHIPS_TOP[..], &SYSTEM_CHIPS_BOTTOM[..]] {
+                        for row in [&SYSTEM_CHIPS_TOP[..], system_chips_bottom_row(has_amp)] {
                             ui.horizontal(|ui| {
                                 for label in row {
                                     let right = chip_stretched(ui, false, label, 0.0).rect.right();
@@ -8021,12 +8234,15 @@ mod tests {
     /// — they were drawn every frame, just past the edge of the window.
     #[test]
     fn the_condensed_system_box_fits_its_chips() {
-        let (room, chips) = system_box_and_chips();
-        for (label, right) in chips {
-            assert!(
-                right <= room + 0.5,
-                "{label} reaches {right} pt into a box with room for {room}"
-            );
+        for has_amp in [false, true] {
+            let (room, chips) = system_box_and_chips(has_amp);
+            assert_eq!(chips.iter().any(|c| c.0 == "AMP"), has_amp);
+            for (label, right) in chips {
+                assert!(
+                    right <= room + 0.5,
+                    "has_amp={has_amp}: {label} reaches {right} pt into a box with room for {room}"
+                );
+            }
         }
     }
 
@@ -8502,7 +8718,7 @@ mod tests {
         let tx = tx_rows_w_for(ui, mode.allows_voice_keyer(), side);
         let display = chip_row_w(ui, &DISPLAY_VIEW_CHIPS).max(chip_row_w(ui, &DISPLAY_TOOL_CHIPS))
             + 2.0 * crate::chrome::MODULE_MARGIN_X;
-        let system = system_rows_w(ui);
+        let system = system_rows_w(ui, false);
         vec![
             StripBox { w: freq_w, flex: 0.0, max_w: freq_w },
             StripBox { w: SMETER_W, flex: 3.0, max_w: f32::INFINITY },

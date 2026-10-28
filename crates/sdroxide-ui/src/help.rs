@@ -39,6 +39,7 @@ const PAGE_FRACTION: f32 = 0.88;
 fn embedded_image(path: &str) -> Option<&'static [u8]> {
     let name = path.rsplit('/').next().unwrap_or(path);
     Some(match name {
+        "amp-window.png" => &include_bytes!("../../../docs/images/amp-window.png")[..],
         "01-main-window.jpg" => &include_bytes!("../../../docs/images/01-main-window.jpg")[..],
         "02-top-bar.jpg" => &include_bytes!("../../../docs/images/02-top-bar.jpg")[..],
         "03-panadapter-tuning.png" => {

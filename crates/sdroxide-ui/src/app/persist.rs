@@ -30,6 +30,32 @@ pub(in crate::app) fn persist_qso_log(_log: &[QsoRecord]) {
     // Written by eframe's periodic `save()` into localStorage.
 }
 
+// ── Wavelog download cursors (native only) ───────────────────────────────────
+//
+// Beside the logbook they describe. Downloading needs the engine in this
+// process, and a browser client never has it, so there is no browser half:
+// it starts from nothing and never writes.
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn load_wavelog_sync() -> sdroxide_types::WavelogSyncState {
+    sdroxide_config::load_wavelog_sync()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn load_wavelog_sync() -> sdroxide_types::WavelogSyncState {
+    sdroxide_types::WavelogSyncState::default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn persist_wavelog_sync(state: &sdroxide_types::WavelogSyncState) {
+    if let Err(e) = sdroxide_config::save_wavelog_sync(state) {
+        eprintln!("failed to save the Wavelog sync position: {e}");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn persist_wavelog_sync(_state: &sdroxide_types::WavelogSyncState) {}
+
 // ── UI/display preferences (native: config.toml [ui]; wasm: eframe storage) ──
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn load_ui_settings(
@@ -120,6 +146,34 @@ pub(in crate::app) fn persist_alerts_settings(cfg: &sdroxide_types::AlertSetting
 
 #[cfg(target_arch = "wasm32")]
 pub(in crate::app) fn persist_alerts_settings(_cfg: &sdroxide_types::AlertSettings) {
+    // Written by eframe's periodic `save()` into localStorage.
+}
+
+// ── TX Audio profiles ─────────────────────────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn load_tx_voice_profiles(
+    _storage: Option<&dyn eframe::Storage>,
+) -> Vec<sdroxide_types::TxVoiceProfile> {
+    sdroxide_config::load_tx_voice_profiles()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn load_tx_voice_profiles(
+    storage: Option<&dyn eframe::Storage>,
+) -> Vec<sdroxide_types::TxVoiceProfile> {
+    storage.and_then(|s| eframe::get_value(s, "tx_voice_profiles")).unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn persist_tx_voice_profiles(profiles: &[sdroxide_types::TxVoiceProfile]) {
+    if let Err(e) = sdroxide_config::save_tx_voice_profiles(profiles) {
+        eprintln!("failed to save TX audio profiles: {e}");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn persist_tx_voice_profiles(_profiles: &[sdroxide_types::TxVoiceProfile]) {
     // Written by eframe's periodic `save()` into localStorage.
 }
 

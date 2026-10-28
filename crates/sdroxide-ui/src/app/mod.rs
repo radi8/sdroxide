@@ -20,9 +20,11 @@
 //! `pub(in crate::app)`, which is as wide as anything here ever gets.
 
 pub(in crate::app) mod alerts;
+mod amp;
 pub(in crate::app) mod awards;
 pub(in crate::app) mod bands;
 pub(in crate::app) mod drm;
+mod duo_power;
 pub(in crate::app) mod frame;
 pub(in crate::app) mod grid_tracker;
 pub(in crate::app) mod hd;
@@ -45,6 +47,7 @@ pub(in crate::app) mod spectrum;
 pub(in crate::app) mod speech;
 pub(in crate::app) mod spots;
 pub(in crate::app) mod top_bar;
+pub(in crate::app) mod tx_audio;
 pub(crate) mod util;
 pub(in crate::app) mod windows;
 pub(in crate::app) mod winlink;
@@ -476,6 +479,8 @@ pub struct SdroxideApp {
     voice: sdroxide_types::VoiceStatus,
     show_voice: bool,
     voice_name_edit: Option<(usize, String)>,
+    /// The TX Audio window (the transmit voice chain) and its own state.
+    tx_audio: tx_audio::TxAudioUi,
     /// When the band/mode, FFT and skimmer popups opened (egui time), for their
     /// auto-fade.
     mode_popup_since: Option<f64>,
@@ -900,6 +905,17 @@ pub struct SdroxideApp {
     /// UI-owned editable copy, seeded from the engine like the configs above.
     wsjtx_edit: sdroxide_types::WsjtxConfig,
     wsjtx_seeded: bool,
+    // ── Received pictures → FTP ──
+    /// UI-owned editable copy, seeded from the engine like the configs above.
+    picup_edit: sdroxide_types::PictureUploadConfig,
+    picup_seeded: bool,
+    /// When a TEST went out, while its answer is awaited. Cleared by the
+    /// answer, or after a while if none comes (the station may have gone).
+    picup_test_pending: Option<f64>,
+    /// The last TEST's answer, with the certificate the server presented.
+    picup_test: Option<sdroxide_types::PictureUploadStatus>,
+    /// How the most recent picture upload went.
+    picup_last: Option<sdroxide_types::PictureUploadStatus>,
     /// Live status from `RadioEvent::RigctldStatus`. Same shape as the TCI
     /// server's, so the two share one status type.
     rigctld_status: Option<TciServerStatus>,
@@ -918,6 +934,44 @@ pub struct SdroxideApp {
     login_tests:
         std::collections::HashMap<sdroxide_types::LoginTarget, sdroxide_types::LoginTestResult>,
     login_tests_pending: std::collections::HashSet<sdroxide_types::LoginTarget>,
+    /// What the last Wavelog connection check found — the station locations
+    /// the settings offer, and a certificate waiting to be trusted. Not
+    /// persisted, for the reason `login_tests` is not.
+    wavelog_probe: Option<sdroxide_types::WavelogProbe>,
+    /// When (egui time) the Wavelog retry queue is next looked at. See
+    /// `SdroxideApp::wavelog_retry_tick`.
+    wavelog_retry_at: f64,
+    /// QSOs Wavelog refused outright this session — a callsign that is not
+    /// the location's, say. Left out of the automatic retry, which would only
+    /// be refused again every few minutes until the settings change; the
+    /// "send unsent" button still includes them, and a restart forgets.
+    wavelog_refused: std::collections::HashSet<u64>,
+    /// How far each Wavelog station location has been downloaded into the
+    /// logbook — see [`sdroxide_types::WavelogSyncState`].
+    wavelog_sync: sdroxide_types::WavelogSyncState,
+    /// When (egui time) the next Wavelog download is due. 0 until the first
+    /// look, which schedules one shortly after start.
+    wavelog_sync_at: f64,
+    /// When the running download was asked for (egui time); `None` when none
+    /// is. Lets a download whose end never arrived — an engine restarted
+    /// under it — stop blocking the next one.
+    wavelog_sync_running: Option<f64>,
+    /// What the running download has done so far, for the line it ends with.
+    wavelog_sync_tally: sdroxide_types::WavelogMerge,
+    /// The last download's outcome, for the settings tab.
+    wavelog_sync_status: Option<String>,
+    /// A download the settings tab asked for (`Some(full)`), picked up by the
+    /// frame's tick. A cell because the settings are drawn through `&self`.
+    wavelog_sync_request: std::cell::Cell<Option<bool>>,
+    /// A full resync's download as it arrives: the contacts, and the highest
+    /// record id seen per location.
+    wavelog_resync_rx: Option<(Vec<QsoRecord>, std::collections::BTreeMap<u32, u64>)>,
+    /// A full resync worked out and waiting for the operator to approve or
+    /// discard it in the settings tab, with the cursors it leaves behind.
+    wavelog_resync: Option<(sdroxide_types::WavelogResync, std::collections::BTreeMap<u32, u64>)>,
+    /// The operator's answer to `wavelog_resync` — apply (`true`) or discard —
+    /// carried out by the frame's tick, for the reason the request is a cell.
+    wavelog_resync_answer: std::cell::Cell<Option<bool>>,
     /// Inbox for an ADIF file chosen via the native "Import" dialog (a picker
     /// thread writes; the UI drains it each frame).
     adif_import_inbox: crate::download::LoadInbox,
@@ -1019,6 +1073,20 @@ pub struct SdroxideApp {
     /// The switching devices the engine's machine can see, from
     /// [`sdroxide_types::DeviceProbe::Relays`].
     relay_devices: Vec<sdroxide_types::RelayDevice>,
+    /// The Hardrock amplifier, mirrored from [`RadioEvent::AmpStatus`] and
+    /// replayed on connect like the T/R switch's.
+    amp_status: sdroxide_types::AmpStatus,
+    /// The Amplifier settings tab's working copy, seeded once like the relay's.
+    amp_edit: sdroxide_types::AmpConfig,
+    amp_seeded: bool,
+    /// The AMP window, and which reading its meter shows.
+    show_amp: bool,
+    /// The AMP window's last state has been read back from the settings.
+    amp_restored: bool,
+    /// When the AMP window's place or picks last changed and are still to be
+    /// written to the settings file.
+    amp_save_at: Option<f64>,
+    amp_meter: amp::AmpMeters,
     /// The station's IARU region, as the General tab's dropdown last showed it.
     ///
     /// Unlike the config buffers around it this is not seeded-once-then-owned
@@ -1448,6 +1516,7 @@ impl SdroxideApp {
             voice: sdroxide_types::VoiceStatus::default(),
             show_voice: false,
             voice_name_edit: None,
+            tx_audio: tx_audio::TxAudioUi::new(storage),
             mode_popup_since: None,
             fft_popup_since: None,
             skimmer_popup_since: None,
@@ -1602,6 +1671,11 @@ impl SdroxideApp {
             rigctld_seeded: false,
             wsjtx_edit: sdroxide_types::WsjtxConfig::default(),
             wsjtx_seeded: false,
+            picup_edit: sdroxide_types::PictureUploadConfig::default(),
+            picup_seeded: false,
+            picup_test_pending: None,
+            picup_test: None,
+            picup_last: None,
             rigctld_status: None,
             tci_srv_edit: sdroxide_types::TciServerConfig::default(),
             tci_srv_seeded: false,
@@ -1611,6 +1685,18 @@ impl SdroxideApp {
             net_log: Vec::new(),
             login_tests: std::collections::HashMap::new(),
             login_tests_pending: std::collections::HashSet::new(),
+            wavelog_probe: None,
+            wavelog_retry_at: 0.0,
+            wavelog_refused: std::collections::HashSet::new(),
+            wavelog_sync: crate::app::persist::load_wavelog_sync(),
+            wavelog_sync_at: 0.0,
+            wavelog_sync_running: None,
+            wavelog_sync_tally: Default::default(),
+            wavelog_sync_status: None,
+            wavelog_sync_request: std::cell::Cell::new(None),
+            wavelog_resync_rx: None,
+            wavelog_resync: None,
+            wavelog_resync_answer: std::cell::Cell::new(None),
             adif_import_inbox: Arc::new(Mutex::new(None)),
             settings_import_inbox: Arc::new(Mutex::new(None)),
             settings_transfer_note: None,
@@ -1647,6 +1733,13 @@ impl SdroxideApp {
             relay_status: Default::default(),
             relay_edit: Default::default(),
             relay_seeded: false,
+            amp_status: Default::default(),
+            amp_edit: Default::default(),
+            amp_seeded: false,
+            show_amp: false,
+            amp_restored: false,
+            amp_save_at: None,
+            amp_meter: Default::default(),
             relay_devices: Vec::new(),
             rot_cfg_seeded: false,
             // Whatever this process is already on: the binary applies the

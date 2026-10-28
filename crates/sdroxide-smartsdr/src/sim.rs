@@ -112,6 +112,16 @@ pub struct SimConfig {
     /// client is on the right machine and listening on the wrong socket, which
     /// looks exactly like a firewall from the inside and is not one.
     pub stream_to_default_port: bool,
+    /// How long a `stream set … daxiq_rate=` takes to land. Until it does, the
+    /// stream goes on carrying the 48 kHz it was created at, and the reply
+    /// waits too.
+    ///
+    /// Measured on a FLEX-8400: 260 ms between the command and the first
+    /// 192 kHz packet, with a quarter of a second of 48 kHz packets streaming
+    /// meanwhile. A client that settles its rate inside that window settles on
+    /// the wrong one — issue #687, a panadapter drawing 192 kHz of band across
+    /// a 48 kHz axis.
+    pub rate_change_delay: Duration,
 }
 
 impl Default for SimConfig {
@@ -145,6 +155,7 @@ impl Default for SimConfig {
             no_free_pan: false,
             foreign_pan_handle: 0xDEAD_BEEF,
             stream_to_default_port: false,
+            rate_change_delay: Duration::ZERO,
         }
     }
 }
@@ -363,6 +374,9 @@ struct Session {
     iq_stream: Option<u32>,
     iq_channel: u32,
     iq_rate: u32,
+    /// A `daxiq_rate` change still on its way in: the rate, the command's
+    /// sequence number, and when it lands. See [`SimConfig::rate_change_delay`].
+    pending_rate: Option<(u32, u32, Instant)>,
     tx_stream: Option<u32>,
     pan_center_hz: f64,
     pan_bw_hz: f64,
@@ -420,6 +434,7 @@ impl Session {
             iq_stream: None,
             iq_channel: 0,
             iq_rate: 48_000,
+            pending_rate: None,
             tx_stream: None,
             pan_center_hz: slice_hz,
             pan_bw_hz: 192_000.0,
@@ -481,12 +496,25 @@ impl Session {
             }
 
             self.maybe_evict();
+            self.land_pending_rate();
             self.pump_iq();
             self.pump_meters();
             self.drain_client_udp(&mut rx_buf);
         }
 
         self.stats.keyed.store(false, Ordering::Relaxed);
+    }
+
+    /// Apply a `daxiq_rate` change whose [`SimConfig::rate_change_delay`] is up.
+    fn land_pending_rate(&mut self) {
+        let Some((rate, seq, at)) = self.pending_rate else { return };
+        if Instant::now() < at {
+            return;
+        }
+        self.pending_rate = None;
+        self.iq_rate = rate;
+        self.reply(seq, 0, "");
+        self.send_iq_stream_status();
     }
 
     fn send_line(&mut self, line: &str) {
@@ -696,9 +724,14 @@ impl Session {
                     && id == self.iq_stream
                 {
                     if p::dax_iq_rate(p::dax_iq_class_code(rate)) == Some(rate) {
-                        self.iq_rate = rate;
-                        self.reply(seq, 0, "");
-                        self.send_iq_stream_status();
+                        let delay = self.cfg.rate_change_delay;
+                        if delay.is_zero() {
+                            self.iq_rate = rate;
+                            self.reply(seq, 0, "");
+                            self.send_iq_stream_status();
+                        } else {
+                            self.pending_rate = Some((rate, seq, Instant::now() + delay));
+                        }
                         return;
                     }
                     self.reply(seq, 0x5000_0020, "unsupported daxiq_rate");

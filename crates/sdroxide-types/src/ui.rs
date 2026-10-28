@@ -506,6 +506,12 @@ pub struct Solar3dWindow {
     /// Outer (top-left, including decorations) position in points.
     #[serde(default)]
     pub pos: Option<[f32; 2]>,
+    /// The same position in screen pixels. Points don't survive a second
+    /// monitor at a different display scale: a new window starts with the
+    /// main screen's scale, so the same points land somewhere else. Pixels
+    /// are the same on every screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos_px: Option<[f32; 2]>,
 }
 
 /// User display preferences. All have defaults so a missing `[ui]` table loads.
@@ -693,6 +699,32 @@ pub struct UiSettings {
     /// its own.
     #[serde(default)]
     pub solar3d_window: Option<Solar3dWindow>,
+    /// The AMP window in a window of its own rather than inside the main one,
+    /// as the solar-system window is. Desktop only; the browser keeps it in.
+    #[serde(default)]
+    pub amp_popped: bool,
+    /// Whether the AMP window was open, so it comes back as it was closed.
+    #[serde(default)]
+    pub amp_open: bool,
+    /// Where the popped-out AMP window was, as for the solar-system window.
+    #[serde(default)]
+    pub amp_window: Option<Solar3dWindow>,
+    /// Where the docked AMP window was inside the main one.
+    #[serde(default)]
+    pub amp_docked: Option<AmpDocked>,
+    /// The AMP window's meter picks: top and bottom of the left meter, then of
+    /// the right one, each as its place in the window's FWD, RFL, VDD, IDD, DRV
+    /// list, 255 for no bottom needle. `None` for the built-in picks.
+    #[serde(default)]
+    pub amp_meters: Option<[u8; 4]>,
+}
+
+/// The docked AMP window's place: its top-left corner and width, in points.
+/// Its height follows the width.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AmpDocked {
+    pub pos: [f32; 2],
+    pub width: f32,
 }
 
 /// Default for [`UiSettings::spot_colors`] — every kind on its stock tint.
@@ -794,6 +826,11 @@ impl Default for UiSettings {
             map_cities: true,
             panadapter_clock: true,
             solar3d_window: None,
+            amp_popped: false,
+            amp_open: false,
+            amp_window: None,
+            amp_docked: None,
+            amp_meters: None,
         }
     }
 }

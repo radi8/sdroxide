@@ -239,6 +239,9 @@ impl eframe::App for SdroxideApp {
         }
 
         let mut cmds = Vec::new();
+        // An FDM-DUO's power buttons and the AMP panel need the radio's
+        // settings from the first frame, not from when Settings is opened.
+        self.load_radio_cfg_for_duo();
         // A channel list chosen in the memories window: parsed here and sent
         // to the engine, which owns the list and the numbering in it.
         self.poll_chirp_import(&mut cmds);
@@ -793,6 +796,8 @@ impl eframe::App for SdroxideApp {
                                     self.q65_panel(ui, &mut cmds);
                                 } else if mode == Mode::Fsk441 {
                                     self.fsk441_panel(ui, &mut cmds);
+                                } else if mode == Mode::Jtty {
+                                    self.jtty_panel(ui, &mut cmds, panel_h);
                                 } else {
                                     self.digi_panel(ui, &mut cmds);
                                 }
@@ -969,6 +974,7 @@ impl eframe::App for SdroxideApp {
         self.drm_window(&ctx, &mut cmds);
         self.hd_window(&ctx, &mut cmds);
         self.voice_window(&ctx, &mut cmds);
+        self.tx_audio_window(&ctx, &mut cmds);
         self.settings_window(&ctx, &mut cmds);
         self.digi_settings_window(&ctx, &mut cmds);
         self.logbook_window(&ctx, &mut cmds);
@@ -980,6 +986,7 @@ impl eframe::App for SdroxideApp {
         self.grid_tracker_window(&ctx);
         self.bands_window(&ctx);
         self.sat_window(&ctx, &mut cmds);
+        self.amp_window(&ctx, &mut cmds);
         self.morse_window(&ctx);
         self.help.ui(&ctx);
         // Last, so it lands on top of everything else that opened this frame.
@@ -1077,6 +1084,15 @@ impl eframe::App for SdroxideApp {
             }
         }
 
+        // A picture-upload TEST whose answer never came: the station went
+        // away, or dropped it. Give the button back rather than spin for ever.
+        // Past the connect, login and transfer timeouts the station applies.
+        if self.picup_test_pending.is_some_and(|t| crate::time::now_unix_f64() - t > 75.0) {
+            self.picup_test_pending = None;
+        }
+
+        self.wavelog_retry_tick(now);
+        self.wavelog_sync_tick(now, &mut cmds);
         // Flush queued lookups / uploads accumulated during window rendering.
         for call in std::mem::take(&mut self.pending_lookups) {
             cmds.push(Command::LookupCallsign { call });
@@ -1106,6 +1122,10 @@ impl eframe::App for SdroxideApp {
             if let Command::TestLogin(t) = &c {
                 self.login_tests_pending.insert(*t);
                 self.login_tests.remove(t);
+            }
+            if let Command::TestPictureUpload(_) = &c {
+                self.picup_test_pending = Some(crate::time::now_unix_f64());
+                self.picup_test = None;
             }
             self.ctrl.send(c);
         }
@@ -1170,6 +1190,10 @@ impl eframe::App for SdroxideApp {
             // hfdl_channels.json, written on change.
             #[cfg(target_arch = "wasm32")]
             eframe::set_value(storage, "hfdl_channels", &self.hfdl_channels);
+            // Likewise the TX Audio profile library: tx_audio_profiles.json
+            // natively.
+            #[cfg(target_arch = "wasm32")]
+            eframe::set_value(storage, "tx_voice_profiles", self.tx_audio.profiles());
         }
     }
 }
@@ -1334,6 +1358,14 @@ impl SdroxideApp {
                     self.error = Some(e);
                     self.arm_retry(now);
                 }
+                RadioEvent::PictureUpload(st) => {
+                    if st.is_test {
+                        self.picup_test_pending = None;
+                        self.picup_test = Some(st);
+                    } else {
+                        self.picup_last = Some(st);
+                    }
+                }
                 RadioEvent::LoginTest(r) => {
                     self.login_tests_pending.remove(&r.target);
                     self.push_net_log(format!(
@@ -1359,6 +1391,8 @@ impl SdroxideApp {
                         }
                     }
                 }
+                RadioEvent::WavelogProbe(p) => self.wavelog_probe = Some(*p),
+                RadioEvent::WavelogBatch(b) => self.on_wavelog_batch(*b),
                 RadioEvent::Notice(n) => {
                     if self.focused {
                         self.speech.announcer.on_notice(n.as_deref(), now);
@@ -1608,11 +1642,32 @@ impl SdroxideApp {
                     self.spots_gen += 1;
                     self.adopted_spots_gen = None;
                 }
-                RadioEvent::TciServerStatus { running, addr, clients, error } => {
-                    self.tci_srv_status = Some(TciServerStatus { running, addr, clients, error });
+                RadioEvent::TciServerStatus {
+                    running,
+                    addr,
+                    clients,
+                    error,
+                    client_connected,
+                    client_error,
+                } => {
+                    self.tci_srv_status = Some(TciServerStatus {
+                        running,
+                        addr,
+                        clients,
+                        error,
+                        client_connected,
+                        client_error,
+                    });
                 }
                 RadioEvent::RigctldStatus { running, addr, clients, error } => {
-                    self.rigctld_status = Some(TciServerStatus { running, addr, clients, error });
+                    self.rigctld_status = Some(TciServerStatus {
+                        running,
+                        addr,
+                        clients,
+                        error,
+                        client_connected: false,
+                        client_error: None,
+                    });
                 }
                 RadioEvent::VoiceStatus(v) => self.voice = v,
                 RadioEvent::ImagePresets(p) => self.sstv.on_presets(p, &ctx),
@@ -1652,6 +1707,10 @@ impl SdroxideApp {
                         self.wsjtx_edit = c.wsjtx.clone();
                         self.wsjtx_seeded = true;
                     }
+                    if !self.picup_seeded {
+                        self.picup_edit = c.picture_upload.clone();
+                        self.picup_seeded = true;
+                    }
                     if !self.sat_cfg_seeded {
                         self.sat_cfg_edit = c.sat.clone();
                         self.sat_cfg = std::sync::Arc::new(c.sat.clone());
@@ -1664,6 +1723,10 @@ impl SdroxideApp {
                     if !self.relay_seeded {
                         self.relay_edit = c.relay.clone();
                         self.relay_seeded = true;
+                    }
+                    if !self.amp_seeded {
+                        self.amp_edit = c.amp.clone();
+                        self.amp_seeded = true;
                     }
                     // Adopted on every announcement rather than seeded once:
                     // these are not dialog buffers the operator types into but
@@ -1694,6 +1757,7 @@ impl SdroxideApp {
                     self.rotator_status = Some((connected, az_deg, el_deg, error));
                 }
                 RadioEvent::RelayStatus(st) => self.relay_status = *st,
+                RadioEvent::AmpStatus(st) => self.amp_status = *st,
                 RadioEvent::ImageSaved(e) => match e.kind {
                     sdroxide_types::ImageKind::Sstv => self.sstv.on_saved(e, &ctx),
                     sdroxide_types::ImageKind::Wefax => self.wefax.on_saved(e, &ctx),
@@ -1860,6 +1924,7 @@ impl SdroxideApp {
         } = self;
         // Read before the borrow below, which takes `self` apart.
         let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
+        let agc_without_off = caps.as_ref().is_some_and(|c| c.agc_off_unavailable);
         // How far a bound zoom-out may go: the full-band lane where the front
         // end has one, else its passband. Read here for the same reason
         // `rig_squelch` is — after this the borrow has taken `self` apart.
@@ -1880,6 +1945,7 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut speech_acts,
             rig_squelch,
+            agc_without_off,
             zoom_out,
         };
         input.poll_pointer_and_keys(ctx, state, &mut sink, cmds);
@@ -1943,6 +2009,7 @@ impl SdroxideApp {
             cmds.push(Command::CwKey(false));
         }
         let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
+        let agc_without_off = caps.as_ref().is_some_and(|c| c.agc_off_unavailable);
         let mut sink = crate::input::UiSink {
             view,
             help: &mut help.open,
@@ -1953,6 +2020,7 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut Vec::new(),
             rig_squelch,
+            agc_without_off,
             // Releasing held keys never pans or zooms, so the passband will do.
             zoom_out: (state.center_hz, state.sample_rate),
         };

@@ -54,7 +54,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
-use sdroxide_types::{DeviceCaps, Mode, PanadapterAudio, PanadapterConfig, PanadapterTap};
+use sdroxide_types::{AgcMode, DeviceCaps, Mode, PanadapterAudio, PanadapterConfig, PanadapterTap};
 use tracing::{info, warn};
 
 /// How much transceiver audio may queue up before the oldest is dropped.
@@ -269,6 +269,9 @@ impl PanadapterSource {
             // antenna on offer is the one on the radio being listened to. A
             // borrowed receiver has its own aerial and no say in this.
             has_rx_antenna: ctrl.has_rx_antenna,
+            // The engine's to decide, from whose audio is being heard and
+            // whether the transceiver's AGC can be reached (`commands_agc`).
+            agc_off_unavailable: false,
         }
     }
 
@@ -696,6 +699,14 @@ impl IqSource for PanadapterSource {
         self.ctrl.set_control_filter(mode, lo_hz, hi_hz);
     }
 
+    fn set_control_agc(&mut self, agc: AgcMode) {
+        self.ctrl.set_control_agc(agc);
+    }
+
+    fn commands_agc(&self) -> bool {
+        self.ctrl.commands_agc()
+    }
+
     fn set_rit_hz(&mut self, hz: f64) {
         self.ctrl.set_rit_hz(hz);
     }
@@ -842,6 +853,10 @@ impl IqSource for PanadapterSource {
     /// and no way back.
     fn set_rig_power(&mut self, on: bool) -> Result<()> {
         self.ctrl.set_rig_power(on)
+    }
+
+    fn set_power_step(&mut self, code: u8) {
+        self.ctrl.set_power_step(code)
     }
 
     fn commands_rig_power(&self) -> bool {

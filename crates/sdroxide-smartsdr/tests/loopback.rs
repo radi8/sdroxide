@@ -107,6 +107,34 @@ fn the_radio_delivers_the_requested_iq_rate() {
     assert_eq!(h.actual_rate_hz(), 192_000.0, "radio is streaming at the wrong rate");
 }
 
+/// The rate is what the packets say, and only once they have said it.
+///
+/// A real radio streams the 48 kHz it created the stream at for a while after
+/// `daxiq_rate` is sent (260 ms on a FLEX-8400). The handle used to report the
+/// *requested* rate before a single packet had arrived, so a caller that waited
+/// for "the rate to settle" settled at once — and the engine built a 48 kHz
+/// receive chain for a 192 kHz stream: issue #687.
+#[test]
+fn the_rate_is_not_claimed_before_the_radio_sends_it() {
+    let sim = SimRadio::start(SimConfig {
+        rate_change_delay: Duration::from_millis(1500),
+        ..SimConfig::default()
+    })
+    .expect("start simulator");
+    let mut h = connect(&sim, 192_000.0);
+
+    let early = h.actual_rate_hz();
+    assert!(early == 0.0 || early == 48_000.0, "claimed {early} Hz before the radio sent it");
+    collect_iq(&mut h, 256);
+    assert_eq!(h.actual_rate_hz(), 48_000.0, "the stream is still at its creation rate");
+
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while h.actual_rate_hz() != 192_000.0 && std::time::Instant::now() < deadline {
+        collect_iq(&mut h, 256);
+    }
+    assert_eq!(h.actual_rate_hz(), 192_000.0, "the rate change never showed up");
+}
+
 #[test]
 fn tuning_moves_the_radios_slice() {
     let sim = sim();

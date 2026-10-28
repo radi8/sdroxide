@@ -516,7 +516,12 @@ impl FlexHandle {
 
         let alive = Arc::new(AtomicBool::new(true));
         let evicted = Arc::new(AtomicBool::new(false));
-        let actual_rate = Arc::new(AtomicU32::new(rate));
+        // Zero, not the rate asked for: this is what the packets say, and none
+        // has arrived yet. Seeded with the request it answered "192 kHz" before
+        // the radio had sent a thing — and the radio's first packets are the
+        // 48 kHz it creates every stream at, so a caller that took that early
+        // answer settled, a moment later, on the wrong rate (issue #687).
+        let actual_rate = Arc::new(AtomicU32::new(0));
         let meters = Arc::new(Mutex::new(MeterTable::default()));
         let tx_stream = Arc::new(AtomicU32::new(0));
 
@@ -622,6 +627,10 @@ impl FlexHandle {
     /// The IQ rate the radio is actually delivering, from the packet class
     /// codes. Differs from the requested rate while a `daxiq_rate` change is
     /// settling — and permanently, if the radio refused it.
+    ///
+    /// `0.0` until the first DAX IQ packet arrives. The stream starts at 48 kHz
+    /// whatever was asked for, so the requested rate is only the answer once a
+    /// packet says so.
     pub fn actual_rate_hz(&self) -> f64 {
         self.actual_rate.load(Ordering::Relaxed) as f64
     }
@@ -1667,7 +1676,8 @@ fn mode_to_flex(m: Mode) -> &'static str {
         | Mode::PacketHf
         | Mode::AtChat
         | Mode::Rade => "DIGU",
-        Mode::Usb | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint | Mode::Spec | Mode::Hfdl => "USB",
+        Mode::Usb | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint | Mode::Spec | Mode::Hfdl
+        | Mode::Jtty => "USB",
     }
 }
 
@@ -1939,7 +1949,7 @@ impl DataThread {
                         drop(table);
                         if changed && self.keyed {
                             let _ =
-                                self.telem.send(TxTelemetry { fwd_w, swr, alc: None, po: None });
+                                self.telem.send(TxTelemetry { fwd_w, swr, alc: None, po: None, rfl_w: None });
                         }
                     }
                 }

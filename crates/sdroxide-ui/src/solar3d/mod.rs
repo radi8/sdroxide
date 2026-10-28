@@ -310,6 +310,7 @@ impl Solar3d {
                 let geom = sdroxide_types::Solar3dWindow {
                     size: [size.x.round(), size.y.round()],
                     pos: pos.map(|p| [p.x.round(), p.y.round()]),
+                    pos_px: None,
                 };
                 if st.window_now != Some(geom) {
                     st.window_now = Some(geom);
@@ -468,7 +469,11 @@ mod tests {
     /// past a screen that has since become smaller.
     #[test]
     fn a_remembered_geometry_is_honoured_and_its_size_still_fits() {
-        let seed = sdroxide_types::Solar3dWindow { size: [900.0, 600.0], pos: Some([100.0, 80.0]) };
+        let seed = sdroxide_types::Solar3dWindow {
+            size: [900.0, 600.0],
+            pos: Some([100.0, 80.0]),
+            pos_px: None,
+        };
         assert_eq!(
             solar3d_geometry(Some(egui::vec2(2560.0, 1440.0)), Some(seed)),
             (egui::vec2(900.0, 600.0), Some(egui::pos2(100.0, 80.0)))
@@ -479,6 +484,7 @@ mod tests {
             Some(sdroxide_types::Solar3dWindow {
                 size: [1600.0, 1200.0],
                 pos: Some([700.0, 500.0]),
+                pos_px: None,
             }),
         );
         assert!(size.x <= 800.0 && size.y <= 600.0, "{size:?} does not fit 800x600");
@@ -492,7 +498,8 @@ mod tests {
     fn a_window_on_a_second_monitor_comes_back_there() {
         let screen = Some(egui::vec2(1920.0, 1080.0));
         for at in [[2100.0, 120.0], [-1500.0, 200.0]] {
-            let seed = sdroxide_types::Solar3dWindow { size: [900.0, 600.0], pos: Some(at) };
+            let seed =
+                sdroxide_types::Solar3dWindow { size: [900.0, 600.0], pos: Some(at), pos_px: None };
             let (_, pos) = solar3d_geometry(screen, Some(seed));
             assert_eq!(pos, Some(egui::Pos2::from(at)), "moved off the monitor it was left on");
         }
