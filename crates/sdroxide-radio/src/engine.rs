@@ -9157,8 +9157,8 @@ impl Engine {
                 if !self.caps.has_atu {
                     return;
                 }
-                if self.tx_active {
-                    self.notice("The tuner keys the radio itself — not while transmitting.");
+                if self.tx_active || self.rig_tx {
+                    self.notice("The antenna tuner can only be operated while the radio is receiving.");
                     return;
                 }
                 if let Err(e) = self.source.atu_tune() {
@@ -9168,6 +9168,10 @@ impl Engine {
             }
             AtuBypass => {
                 if !self.caps.has_atu {
+                    return;
+                }
+                if self.tx_active || self.rig_tx {
+                    self.notice("The antenna tuner can only be operated while the radio is receiving.");
                     return;
                 }
                 if let Err(e) = self.source.atu_bypass() {
