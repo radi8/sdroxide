@@ -286,6 +286,53 @@ impl IoBoard {
         }
     }
 
+    /// Request a generic tuner tune operation.
+    ///
+    /// The request is accepted only when a tuner is positively detected,
+    /// its latest status is fresh and exactly idle (0x00), and no tuner
+    /// command is already awaiting acknowledgement.
+    pub(crate) fn request_tune(&mut self, now: Instant) -> bool {
+        self.request_tuner_command(TUNER_CMD_TUNE, now)
+    }
+
+    /// Request generic tuner bypass.
+    pub(crate) fn request_bypass(&mut self, now: Instant) -> bool {
+        self.request_tuner_command(TUNER_CMD_BYPASS, now)
+    }
+
+    fn request_tuner_command(&mut self, command: u8, now: Instant) -> bool {
+        let tuner_present =
+            matches!(self.tuner_discovery, TunerDiscovery::Complete { present: true, .. });
+
+        let status_is_idle_and_fresh = self.tuner_status.is_some_and(|(status, received_at)| {
+            status == 0x00
+                && now
+                    .checked_duration_since(received_at)
+                    .is_some_and(|age| age <= TUNER_STATUS_MAX_AGE)
+        });
+
+        if !tuner_present || !status_is_idle_and_fresh || self.tuner_command_pending {
+            tracing::debug!(
+                "HL2IOBoard: tuner command 0x{command:02X} rejected \
+                 (present={tuner_present}, status={:?}, pending={})",
+                self.tuner_status.map(|(status, _)| status),
+                self.tuner_command_pending
+            );
+            return false;
+        }
+
+        self.queue.push_back(Op::write(REG_ANTENNA_TUNER, command));
+        self.tuner_command_pending = true;
+
+        // The old idle status must not authorise another command. A fresh
+        // status read is required after this command has been acknowledged.
+        self.tuner_status = None;
+        self.tuner_status_poll_at = None;
+
+        tracing::info!("HL2IOBoard: tuner command 0x{command:02X} queued");
+        true
+    }
+
     /// The C&C block to put in this datagram, or `None` to leave the slot to the
     /// ordinary register rotation — which is the answer almost every time, since
     /// this talks only when the frequency moves.
