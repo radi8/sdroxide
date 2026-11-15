@@ -864,7 +864,17 @@ impl AutoGain {
 /// arriving hundreds of times a second is invisible otherwise — and short
 /// enough that a light still on means the front end is still in trouble.
 pub const OVERLOAD_HOLD: Duration = Duration::from_millis(1500);
-
+/// Snapshot of the generic antenna tuner's discovery and runtime status.
+///
+/// `present` is None until discovery has completed or if the interface
+/// is unsupported. `raw_status` and `updated_at` describe the latest
+/// status byte received from the Pico.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HpsdrTunerStatus {
+    pub present: Option<bool>,
+    pub raw_status: Option<u8>,
+    pub updated_at: Option<Instant>,
+}
 /// Everything a protocol thread needs: the socket, the radio address, the
 /// rates, the TX ring and the control channel. The RX rings arrive per DDC
 /// with [`Ctrl::Attach`] — streams come and go while the connection runs.
@@ -904,6 +914,8 @@ pub(crate) struct ThreadCtx {
     /// [`OVERLOAD_HOLD`] after the last report — published for
     /// [`HpsdrRx::adc_overload`].
     pub adc_overload: Arc<AtomicBool>,
+    /// Latest generic antenna tuner status, published by the protocol thread.
+    pub tuner_status: Arc<Mutex<HpsdrTunerStatus>>,
     /// The radio's own PTT line, published for [`HpsdrRx::radio_ptt`].
     pub radio_ptt: Arc<AtomicBool>,
     /// The board's temperature in hundredths of a degree Celsius, published for
@@ -968,6 +980,8 @@ struct DevInner {
     /// for the length of an over (an FT8 burst is 12.6 s), which must not be
     /// read as a dead link.
     transmitting: Arc<AtomicBool>,
+    /// Latest generic antenna tuner status, shared with the protocol thread.
+    tuner_status: Arc<Mutex<HpsdrTunerStatus>>,
     /// The state of the radio's own PTT line — a foot switch, a mic button, or
     /// whatever else is wired to the board's PTT input — as the network thread
     /// last saw it reported. A *level*, so a poll can never miss an edge by
@@ -1127,6 +1141,7 @@ impl HpsdrBoard {
         // drops it a moment from now it will leave the stream alone.
         let conn_id = claim_connection(IpAddr::V4(ip));
         let radio_ptt = Arc::new(AtomicBool::new(false));
+        let tuner_status = Arc::new(Mutex::new(HpsdrTunerStatus::default()));
         let temp_centi_c = Arc::new(AtomicI32::new(TEMP_UNKNOWN));
         let fwd_power_raw = Arc::new(AtomicU16::new(POWER_UNKNOWN));
         let rev_power_raw = Arc::new(AtomicU16::new(POWER_UNKNOWN));
@@ -1158,6 +1173,7 @@ impl HpsdrBoard {
             auto_gain,
             lna_gain_centi_db: Arc::clone(&lna_gain_centi_db),
             adc_overload: Arc::clone(&adc_overload),
+            tuner_status: Arc::clone(&tuner_status),
             radio_ptt: Arc::clone(&radio_ptt),
             temp_centi_c: Arc::clone(&temp_centi_c),
             fwd_power_raw: Arc::clone(&fwd_power_raw),
@@ -1195,6 +1211,7 @@ impl HpsdrBoard {
                 adc_overload,
                 opened_at,
                 transmitting: Arc::new(AtomicBool::new(false)),
+                tuner_status,
                 radio_ptt,
                 temp_centi_c,
                 fwd_power_raw,
@@ -1552,6 +1569,14 @@ impl HpsdrRx {
             let _ = self.dev.ctrl.send(Ctrl::TxOn(tx_freq_hz));
         }
         self.dev.tx_rate_hz
+    }
+
+    /// Latest generic antenna tuner status reported by the accessory board.
+    ///
+    /// The returned snapshot is copied under a short-lived lock. Reading it
+    /// does not block the protocol thread or initiate an I2C transaction.
+    pub fn tuner_status(&self) -> HpsdrTunerStatus {
+        *self.dev.tuner_status.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The state of the radio's own PTT line — a foot switch, a mic button, or

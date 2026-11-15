@@ -500,6 +500,18 @@ fn start_command(run: bool) -> [u8; 64] {
     c
 }
 
+fn publish_tuner_status(
+    io_board: Option<&crate::ioboard::IoBoard>,
+    shared: &std::sync::Mutex<crate::net::HpsdrTunerStatus>,
+) {
+    let snapshot = match io_board {
+        Some(board) => board.status_snapshot(),
+        None => crate::net::HpsdrTunerStatus::default(),
+    };
+
+    *shared.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+}
+
 /// Leave the stream in the right state on the way out. A connection that has
 /// been superseded — Apply/reconnect opened a replacement while this one was
 /// still running — must not send the stop command: the radio is already
@@ -535,6 +547,7 @@ pub(crate) fn run(ctx: ThreadCtx) {
         lna_gain_centi_db,
         adc_overload: overload_line,
         radio_ptt: ptt_line,
+        tuner_status,
         temp_centi_c,
         fwd_power_raw,
         rev_power_raw,
@@ -812,6 +825,7 @@ pub(crate) fn run(ctx: ThreadCtx) {
                         && let Some(b) = io_board.as_mut()
                     {
                         b.on_ack(raddr, data, Instant::now());
+                        publish_tuner_status(io_board.as_ref(), &tuner_status);
                     }
                     // The radio's own PTT input (a Hermes-Lite's CN4 ring, a
                     // foot switch, a mic button). Published as a level for
@@ -936,7 +950,7 @@ pub(crate) fn run(ctx: ThreadCtx) {
                 return;
             }
         }
-
+        publish_tuner_status(io_board.as_ref(), &tuner_status);
         // The overload light and the loop that acts on it. Outside the receive
         // arm because both have to keep working through a gap in the stream:
         // an indicator that stayed lit because no frame arrived to clear it
@@ -1018,6 +1032,7 @@ pub(crate) fn run(ctx: ThreadCtx) {
                 .as_mut()
                 .and_then(|b| b.next_request(now, io_tx, io_rx, mox))
                 .unwrap_or_else(|| regs.cc(rot.take(&regs)));
+            publish_tuner_status(io_board.as_ref(), &tuner_status);
             let d = build_ep2(&mut out_seq, speed, mox, regs.oc(), cc, &tx_scratch);
             let _ = socket.send_to(&d, dest);
             let late = now.saturating_duration_since(next_ep2);

@@ -300,6 +300,25 @@ impl IoBoard {
         self.request_tuner_command(TUNER_CMD_BYPASS, now)
     }
 
+    /// Return the current tuner discovery and status snapshot.
+    pub(crate) fn status_snapshot(&self) -> crate::net::HpsdrTunerStatus {
+        let present = match self.tuner_discovery {
+            TunerDiscovery::Complete { present, .. } => Some(present),
+            _ => None,
+        };
+
+        let (raw_status, updated_at) = match self.tuner_status {
+            Some((status, received_at)) => (Some(status), Some(received_at)),
+            None => (None, None),
+        };
+
+        crate::net::HpsdrTunerStatus {
+            present,
+            raw_status,
+            updated_at,
+        }
+    }
+
     fn request_tuner_command(&mut self, command: u8, now: Instant) -> bool {
         let tuner_present =
             matches!(self.tuner_discovery, TunerDiscovery::Complete { present: true, .. });
