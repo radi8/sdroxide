@@ -387,7 +387,31 @@ impl IoBoard {
                 self.queue.push_front(Op::read(REG_ANTENNA_TUNER));
             }
         }
+        // Poll the generic tuner status while a positively detected tuner
+        // is available. Do not poll while a command write is awaiting ACK.
+        if matches!(self.tuner_discovery, TunerDiscovery::Complete { present: true, .. })
+            && !self.tuner_command_pending
+            && self.tuner_status_poll_at.is_some_and(|poll_at| now >= poll_at)
+        {
+            let read_already_queued = self.queue.iter().any(|op| {
+                op.cookie == I2C_READ && op.addr == IOB_ADDR && op.reg == REG_ANTENNA_TUNER
+            });
 
+            let read_in_flight = self.inflight.as_ref().is_some_and(|f| {
+                f.op.cookie == I2C_READ && f.op.addr == IOB_ADDR && f.op.reg == REG_ANTENNA_TUNER
+            });
+
+            self.tuner_status_poll_at = None;
+
+            if !read_already_queued && !read_in_flight {
+                self.queue.push_back(Op {
+                    cookie: I2C_READ,
+                    addr: IOB_ADDR,
+                    reg: REG_ANTENNA_TUNER,
+                    data: 0,
+                });
+            }
+        }
         self.refill(now, tx_freq_hz, rx_freq_hz);
         let op = self.queue.pop_front()?;
         self.inflight = Some(InFlight { op, sent_at: now, tries: 0 });
