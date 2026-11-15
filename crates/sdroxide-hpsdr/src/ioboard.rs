@@ -926,6 +926,7 @@ mod tests {
             ack(&mut board, now, [0, 0, 0, TUNER_DISCOVER]);
         }
     }
+
     #[test]
     fn probe_reads_the_version_register_and_then_resets_the_board() {
         let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
@@ -1074,6 +1075,7 @@ mod tests {
     /// The receive code is what the board picks an antenna and preselector on.
     /// It is deduplicated on the *code*, and a code is 6.68 % wide — so tuning
     /// around a band says nothing at all while moving to another says it once.
+
     #[test]
     fn the_receive_code_speaks_on_a_band_change_and_not_on_a_tune() {
         // Each amateur band is its own code, and adjacent bands never share
@@ -1209,5 +1211,71 @@ mod tests {
         // The real one still lands.
         board.on_ack(CC_I2C2 >> 1, [0xF1, 0, 0, 0], now);
         assert_eq!(board.presence, Presence::Present);
+    }
+
+    #[test]
+    fn tuner_commands_require_a_fresh_idle_status() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+
+        request_tuner_discovery(&mut board, now);
+        ack(&mut board, now, [9, 7, TUNER_PRESENT, 0]);
+        assert!(board.request_tune(now));
+        assert!(board.tuner_command_pending);
+
+        // A second command cannot be accepted while the first is pending.
+        assert!(!board.request_bypass(now));
+    }
+
+    #[test]
+    fn tuner_command_is_rejected_when_status_is_not_idle() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+
+        request_tuner_discovery(&mut board, now);
+        ack(&mut board, now, [9, 7, TUNER_PRESENT, 0x04]);
+        assert!(!board.request_tune(now));
+        assert!(!board.tuner_command_pending);
+    }
+
+    #[test]
+    fn tuner_command_is_rejected_when_status_is_stale() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+
+        request_tuner_discovery(&mut board, now);
+        ack(&mut board, now, [9, 7, TUNER_PRESENT, 0]);
+
+        assert!(!board.request_tune(
+            now + TUNER_STATUS_MAX_AGE + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn tuner_command_ack_requires_a_new_status_read() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+
+        request_tuner_discovery(&mut board, now);
+        ack(&mut board, now, [9, 7, TUNER_PRESENT, 0]);
+
+        assert!(board.request_tune(now));
+
+        let command = board.next_request(now, RX_HZ, RX_HZ, 0).expect("tune command");
+        assert_eq!(
+            (command[1], command[3], command[4]),
+            (I2C_WRITE, REG_ANTENNA_TUNER, TUNER_CMD_TUNE)
+        );
+
+        ack(&mut board, now, [0; 4]);
+
+        assert!(!board.tuner_command_pending);
+        assert_eq!(board.tuner_status, None);
+
+        // The next request should be a status read, not another tuner command.
+        let poll = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("post-command status read");
+        assert_eq!((poll[1], poll[3]), (I2C_READ, REG_ANTENNA_TUNER));
     }
 }
