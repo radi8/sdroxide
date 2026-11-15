@@ -107,6 +107,14 @@ const TUNER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Maximum time allowed for generic tuner discovery.
 const TUNER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Interval between runtime tuner status reads.
+const TUNER_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Maximum age of a tuner status that may authorise a command.
+const TUNER_STATUS_MAX_AGE: Duration = Duration::from_millis(200);
+
+/// Generic tuner commands written to REG_ANTENNA_TUNER.
+const TUNER_CMD_TUNE: u8 = 0x01;
+const TUNER_CMD_BYPASS: u8 = 0x02;
 /// Receiver 1's frequency, as a one-byte *code* rather than a frequency —
 /// registers 13..=24 hold one for each of the twelve receivers the protocol can
 /// carry. The board uses them to pick a receive antenna and preselector; all
@@ -212,6 +220,12 @@ pub(crate) struct IoBoard {
     tuner_discovery: TunerDiscovery,
     tuner_discovery_deadline: Option<Instant>,
     tuner_poll_at: Option<Instant>,
+    /// Most recently reported raw tuner status and the time it was received.
+    tuner_status: Option<(u8, Instant)>,
+    /// When the next runtime status poll is due.
+    tuner_status_poll_at: Option<Instant>,
+    /// True while a TUNE or BYPASS write is awaiting its I2C ACK.
+    tuner_command_pending: bool,
     /// Which input the operator has wired the board for, stated once after the
     /// reset. Only the connection knows this; the board itself comes up at 0.
     rx_input: HpsdrIoRxInput,
@@ -239,6 +253,9 @@ impl IoBoard {
             tuner_discovery: TunerDiscovery::NotStarted,
             tuner_discovery_deadline: None,
             tuner_poll_at: None,
+            tuner_status: None,
+            tuner_status_poll_at: None,
+            tuner_command_pending: false,
             rx_input,
             inflight: None,
             queue: VecDeque::new(),
