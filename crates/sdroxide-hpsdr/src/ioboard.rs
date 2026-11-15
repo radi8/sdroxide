@@ -592,6 +592,30 @@ impl IoBoard {
                 );
             }
         }
+        // Runtime status reads return register 7 in the fourth response byte.
+        // Preserve the raw value: only 0x00 has idle-command permission.
+        if f.op.cookie == I2C_READ
+            && f.op.addr == IOB_ADDR
+            && f.op.reg == REG_ANTENNA_TUNER
+            && matches!(self.tuner_discovery, TunerDiscovery::Complete { present: true, .. })
+        {
+            let status = data[3];
+            self.tuner_status = Some((status, now));
+            self.tuner_status_poll_at = Some(now + TUNER_STATUS_POLL_INTERVAL);
+
+            tracing::debug!("HL2IOBoard: tuner status -> 0x{status:02X}");
+        }
+        // A command ACK confirms the I2C write was received, not that
+        // the tuner operation has completed. Require a new status read.
+        if f.op.cookie == I2C_WRITE
+            && f.op.addr == IOB_ADDR
+            && f.op.reg == REG_ANTENNA_TUNER
+            && matches!(f.op.data, TUNER_CMD_TUNE | TUNER_CMD_BYPASS)
+        {
+            self.tuner_command_pending = false;
+            self.tuner_status = None;
+            self.tuner_status_poll_at = Some(now);
+        }
     }
 
     /// A transaction that will not complete.
