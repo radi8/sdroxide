@@ -645,6 +645,25 @@ impl IoBoard {
             );
             return;
         }
+        // A failed runtime tuner read or command must not disrupt the
+        // ordinary frequency and receive-input update sequence.
+        if op.addr == IOB_ADDR
+            && op.reg == REG_ANTENNA_TUNER
+            && matches!(self.tuner_discovery, TunerDiscovery::Complete { present: true, .. })
+        {
+            if op.cookie == I2C_WRITE && matches!(op.data, TUNER_CMD_TUNE | TUNER_CMD_BYPASS) {
+                self.tuner_command_pending = false;
+            }
+
+            self.tuner_status = None;
+            self.tuner_status_poll_at = Some(now + TUNER_STATUS_POLL_INTERVAL);
+
+            tracing::warn!(
+                "HL2IOBoard: tuner transaction failed ({why}); \
+                 waiting for another status read"
+            );
+            return;
+        }
         // Abandon the rest of the sequence with it. A frequency the board only
         // half received is not a frequency — and the byte that went missing may
         // have been the one that latches — so forget that it was ever sent and
