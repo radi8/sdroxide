@@ -230,6 +230,7 @@ impl PanadapterSource {
             antennas_tx: ctrl.antennas_tx.clone(),
             // The meters that matter here are the transmitter's.
             sensors: ctrl.sensors.clone(),
+            has_atu: false,
             has_swr_sensor: ctrl.has_swr_sensor,
             has_fwd_power_sensor: ctrl.has_fwd_power_sensor,
             shared_lo_rx: rx.shared_lo_rx,

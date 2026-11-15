@@ -1587,6 +1587,14 @@ pub enum Command {
     ///
     /// Appended for the usual reason — postcard numbers variants by position.
     RescanPttInputs,
+
+    /// Request an antenna-tuner matching operation.
+    /// Appended last to preserve existing postcard variant indices.
+    AtuTune,
+
+    /// Request that the external antenna tuner be bypassed.
+    /// Appended last to preserve existing postcard variant indices.
+    AtuBypass,
 }
 
 /// What a [`Command::GetKnownCalls`] was answered with.

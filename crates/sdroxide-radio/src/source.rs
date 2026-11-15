@@ -345,6 +345,38 @@ pub trait IqSource: Send {
     /// Asked on every pass of the engine loop, like [`Self::learned_antennas`],
     /// so it must not allocate or take a lock that anything else holds for
     /// long.
+    /// Current external tuner state, or None until a tuner is positively detected.
+    fn atu(&self) -> Option<sdroxide_types::AtuState> {
+        None
+    }
+    /// Request tuner matching through the standard host transmit path.
+    fn atu_tune(&mut self) -> Result<()> {
+        Ok(())
+    /// Current external tuner state, or None until a tuner is positively detected.
+    fn atu(&self) -> Option<sdroxide_types::AtuState> {
+        None
+    }
+    /// Request tuner matching through the standard host transmit path.
+    fn atu_tune(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// Request that the external tuner be bypassed.
+    fn atu_bypass(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether this radio has a separate *receiving* antenna connector, and
+    /// whether it is switched into the receive path.
+    ///
+    /// `None` — the default — where it has none, or has not said yet, which is
+    /// every SDR: a board's ports are a choice between sockets, not an extra
+    /// input switched in alongside the one the transmitter uses. `Some`
+    /// becomes `DeviceCaps::has_rx_antenna` (that there is one) and
+    /// `RadioState::rx_antenna` (which way it is set).
+    ///
+    /// Asked on every pass of the engine loop, like [`Self::learned_antennas`],
+    /// so it must not allocate or take a lock that anything else holds for
+    /// long.
     fn rx_antenna(&self) -> Option<bool> {
         None
     }
@@ -356,6 +388,7 @@ pub trait IqSource: Send {
     fn set_rx_antenna(&mut self, _on: bool) -> Result<()> {
         Ok(())
     }
+
     /// Ask the radio again what its antennas are set to, because something it
     /// recalls per band has just happened — a band change, or a socket
     /// command whose answer belongs to the socket being selected rather than
@@ -1556,6 +1589,15 @@ impl IqSource for ConvertedSource {
     }
     fn commands_rig_power(&self) -> bool {
         self.inner.commands_rig_power()
+    }
+    fn atu(&self) -> Option<sdroxide_types::AtuState> {
+        self.inner.atu()
+    }
+    fn atu_tune(&mut self) -> Result<()> {
+        self.inner.atu_tune()
+    }
+    fn atu_bypass(&mut self) -> Result<()> {
+        self.inner.atu_bypass()
     }
     fn rx_antenna(&self) -> Option<bool> {
         self.inner.rx_antenna()

@@ -471,6 +471,55 @@ pub fn panadapter_fft_ceiling(
     Some(fft)
 }
 
+/// State reported by an external antenna tuner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AtuStatus {
+    /// No operation is currently reported.
+    #[default]
+    Idle,
+    /// A matching operation is in progress.
+    Tuning,
+    /// A matching network is in circuit.
+    Tuned,
+    /// The tuner is out of circuit.
+    Bypass,
+    /// The last matching operation failed.
+    Failed,
+    /// The last matching operation was interrupted.
+    Aborted,
+}
+
+/// Generic external antenna-tuner state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AtuState {
+    pub status: AtuStatus,
+    /// Whether the tuner is in the transmit path.
+    pub enabled: bool,
+    /// Whether a stored tuner match is being used.
+    pub using_memory: bool,
+    /// Whether this tuner provides the generic Reg7 diagnostic register.
+    #[serde(default)]
+    pub reg7_supported: bool,
+    /// Last raw Reg7 status byte, retained for diagnostics.
+    #[serde(default)]
+    pub reg7_status: Option<u8>,
+    /// Whether the last Reg7 status byte is still fresh.
+    #[serde(default)]
+    pub reg7_fresh: bool,
+    /// Host-side command-delivery failure, distinct from a tuner fault.
+    #[serde(default)]
+    pub command_error: Option<AtuCommandError>,
+}
+
+/// Failure reported by the host command-delivery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AtuCommandError {
+    /// The command was rejected before being queued.
+    Rejected,
+    /// The command could not be delivered or acknowledged.
+    DeliveryFailed,
+}
+
 /// Complete radio state snapshot. Kept small (~300 bytes serialized) so full
 /// snapshots — never deltas — travel on every change, latest-wins.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -718,6 +767,9 @@ pub struct RadioState {
     /// numbers fields by position.
     #[serde(default)]
     pub meshtastic: crate::MeshtasticSettings,
+    /// External antenna-tuner state. Appended last for postcard compatibility.
+    #[serde(default)]
+    pub atu: AtuState,
 }
 
 impl Default for RadioState {
@@ -736,6 +788,7 @@ impl Default for RadioState {
             sonde: crate::SondeSettings::default(),
             wxsat: crate::WxsatSettings::default(),
             meshtastic: crate::MeshtasticSettings::default(),
+            atu: AtuState::default(),
             decimation: no_decimation(),
             rx: [RxState::with_mode(mode), RxState::with_mode(mode)],
             sub_rx_enabled: false,

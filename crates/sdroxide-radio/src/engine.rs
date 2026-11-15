@@ -5050,6 +5050,8 @@ fn engine_thread(
     caps.commands_squelch = source.commands_squelch();
     caps.commands_rig_power = source.commands_rig_power();
     caps.has_rx_antenna = source.rx_antenna().is_some();
+    let atu = source.atu();
+    caps.has_atu = atu.is_some();
     caps.wide_span_hz = source.wide_span_hz();
     let audio_mode = caps.audio_mode;
     let radio_fs = source.sample_rate();
@@ -5098,6 +5100,7 @@ fn engine_thread(
     // refuses it must leave the UI showing the port actually in use.
     state.antenna_rx = source.current_antenna();
     state.antenna_tx = source.current_tx_antenna();
+    state.atu = atu.unwrap_or_default();
     // Published so every UI attached to this engine — including a remote one
     // started by somebody else — can warn about it.
     state.oob_tx = !engine_cfg.tx_ham_only;
@@ -6245,6 +6248,7 @@ fn engine_thread(
         // answers once its control link has been open a round trip.
         engine.refresh_antennas();
         engine.refresh_rx_antenna();
+        engine.refresh_atu();
 
         // Drive the FT8/FT4 slot machine (runs in both RX and TX). Returns
         // owned actions to avoid borrowing `engine.digi` and `engine` at once.
@@ -13098,6 +13102,13 @@ impl Engine {
                 return;
             }
 
+            // Stage 1 adds the generic command vocabulary; actual tuner
+            // command handling is added with the HPSDR transport/interlock stages.
+            AtuTune | AtuBypass => {
+                self.notice("Antenna-tuner controls are not available yet.");
+                return;
+            }
+
             ProfileDelete(name) => {
                 self.poll_shared_stores();
                 let before = self.profiles.len();
@@ -19103,6 +19114,30 @@ impl Engine {
         }
     }
 
+    /// Refresh the external tuner state and its availability capability.
+    ///
+    /// A source may not know whether a tuner is attached until its discovery
+    /// exchange has completed, so this is polled on the engine loop rather than
+    /// treating the initial source capability as permanent.
+    fn refresh_atu(&mut self) {
+        let now = self.source.atu();
+        let next_state = now.unwrap_or_default();
+        let mut state_changed = false;
+
+        if self.state.atu != next_state {
+            self.state.atu = next_state;
+            state_changed = true;
+        }
+        if now.is_some() != self.caps.has_atu {
+            self.caps.has_atu = now.is_some();
+            let _ = self.event_tx.send(RadioEvent::CapabilitiesUpdated(self.caps.clone()));
+            state_changed = true;
+        }
+        if state_changed {
+            let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
+        }
+    }
+
     /// Re-publish the RX gain ranges when what they depend on has moved.
     ///
     /// The same shape as [`Engine::refresh_antennas`], and there for a
@@ -20439,6 +20474,8 @@ impl Engine {
         self.caps.commands_squelch = self.source.commands_squelch();
         self.caps.commands_rig_power = self.source.commands_rig_power();
         self.caps.has_rx_antenna = self.source.rx_antenna().is_some();
+        let atu = self.source.atu();
+        self.caps.has_atu = atu.is_some();
         self.caps.wide_span_hz = self.source.wide_span_hz();
         // The old front end's full-band lane went with it. Left in place, its
         // last sweep stayed the window the strip was drawn against.
@@ -20473,6 +20510,7 @@ impl Engine {
             tx_gains: self.source.current_tx_gains(),
             antenna_rx: self.source.current_antenna(),
             antenna_tx: self.source.current_tx_antenna(),
+            atu: atu.unwrap_or_default(),
             // The levels carry over; a keyed transmit never does.
             tx: sdroxide_types::TxState { ptt: false, tune: false, ..self.state.tx },
             // The scan was walking the old front end's span.

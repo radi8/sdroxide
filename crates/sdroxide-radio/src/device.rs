@@ -922,6 +922,7 @@ fn probe_caps(dev: &soapysdr::Device) -> Result<DeviceCaps> {
         antennas_rx,
         antennas_tx,
         sensors,
+        has_atu: false,
         has_swr_sensor,
         has_fwd_power_sensor,
         // SoapySDR gives no way to ask whether channels share a synthesiser;

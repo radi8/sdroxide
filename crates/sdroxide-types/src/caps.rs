@@ -338,6 +338,11 @@ pub struct DeviceCaps {
     /// already on the wire keeps its number.
     #[serde(default)]
     pub has_rx_antenna: bool,
+    /// A generic external antenna tuner has been positively detected.
+    /// This is reported by the source, not inferred from the I/O board family.
+    /// Appended last to preserve the postcard field order already in use.
+    #[serde(default)]
+    pub has_atu: bool,
 }
 
 impl DeviceCaps {
