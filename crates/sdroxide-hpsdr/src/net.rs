@@ -661,6 +661,17 @@ pub enum HpsdrError {
     Msg(String),
 }
 
+/// Result of delivering an ATU command to the Pico over I2C.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HpsdrAtuCommandResult {
+    /// The network thread or I/O board rejected the request before the write.
+    Rejected,
+    /// The Pico acknowledged the I2C write. This is not tune completion.
+    Acknowledged,
+    /// The I2C write did not receive an acknowledgement before giving up.
+    Failed,
+}
+
 /// Control messages from the handles to the network thread.
 pub(crate) enum Ctrl {
     /// A DDC stream coming up: store its ring + liveness clock, enable it on
@@ -704,8 +715,9 @@ pub(crate) enum Ctrl {
     /// (issue #292). Protocol 1 only; there is no accessory bus on Protocol 2.
     IoRxInput(HpsdrIoRxInput),
     /// Request an antenna tuner operation (Protocol 1 accessory board only).
-    AtuTune,
-    AtuBypass,
+    /// The reply reports whether the I2C write reached the Pico, not tune completion.
+    AtuTune(std::sync::mpsc::Sender<HpsdrAtuCommandResult>),
+    AtuBypass(std::sync::mpsc::Sender<HpsdrAtuCommandResult>),
     /// Where the radio *would* transmit, sent while receiving so an accessory
     /// board can switch bands before the operator keys. Loads the TX NCO
     /// register too, which is harmless: it does nothing until MOX.
@@ -1584,20 +1596,33 @@ impl HpsdrRx {
 
     /// Request an antenna tuner tune operation.
     ///
-    /// Returns true if the request was queued for the network thread.
-    /// This does not indicate that the tuner accepted or completed the operation.
+    /// The returned receiver reports whether the I2C write reached the Pico.
+    /// It does not indicate that tuning has completed; Reg7 reports that separately.
     /// Protocol 1 accessory board only; only DDC 0 sends board-level commands.
-    pub fn request_atu_tune(&self) -> bool {
-        self.ddc == 0 && self.dev.ctrl.send(Ctrl::AtuTune).is_ok()
+    pub fn request_atu_tune(
+        &self,
+    ) -> Option<std::sync::mpsc::Receiver<HpsdrAtuCommandResult>> {
+        if self.ddc != 0 {
+            return None;
+        }
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.dev.ctrl.send(Ctrl::AtuTune(reply_tx)).ok()?;
+        Some(reply_rx)
     }
 
-    /// Request antenna tuner bypass.
-    ///
-    /// Returns true if the request was queued for the network thread.
-    /// This does not indicate that the tuner accepted or completed the operation.
-    /// Protocol 1 accessory board only; only DDC 0 sends board-level commands.
-    pub fn request_atu_bypass(&self) -> bool {
-        self.ddc == 0 && self.dev.ctrl.send(Ctrl::AtuBypass).is_ok()
+    /// Request antenna tuner bypass. The returned result has the same meaning
+    /// as request_atu_tune: it confirms the I2C write, not tune completion.
+    pub fn request_atu_bypass(
+        &self,
+    ) -> Option<std::sync::mpsc::Receiver<HpsdrAtuCommandResult>> {
+        if self.ddc != 0 {
+            return None;
+        }
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.dev.ctrl.send(Ctrl::AtuBypass(reply_tx)).ok()?;
+        Some(reply_rx)
     }
 
     /// The state of the radio's own PTT line — a foot switch, a mic button, or

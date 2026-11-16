@@ -14,8 +14,10 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use sdroxide_dsp::{Decimator, Diversity, PureSignal};
-use sdroxide_hpsdr::{HpsdrBoard, HpsdrRx, LNA_GAIN_ELEMENT};
-use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
+use sdroxide_hpsdr::{
+    HpsdrAtuCommandResult, HpsdrBoard, HpsdrRx, LNA_GAIN_ELEMENT,
+};
+use sdroxide_radio::{Complex32, ControlUpdate, IqSource, RadioError, Result};
 
 use crate::device_registry::{DeviceKey, SharedDevice, registry};
 
@@ -42,6 +44,153 @@ const PS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the diversity filter's achieved null depth reaches the log — the
 /// same interval the other diversity-capable backends use.
 const DIV_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum age of an HPSDR tuner status before it is considered stale.
+const TUNER_STATUS_MAX_AGE: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtuOperation {
+    Tune,
+    Bypass,
+}
+
+/// Interpret a newly received generic tuner status byte.
+fn observe_atu_status(
+    atu_state: &mut sdroxide_types::AtuState,
+    atu_operation: &mut Option<AtuOperation>,
+    atu_saw_rf_request: &mut bool,
+    status: u8,
+) {
+    atu_state.reg7_status = Some(status);
+    atu_state.reg7_fresh = true;
+
+    match status {
+        // The tuner is requesting RF so that it can perform a match.
+        0xEE => {
+            *atu_saw_rf_request = true;
+            atu_state.status = sdroxide_types::AtuStatus::Tuning;
+            atu_state.enabled = true;
+            atu_state.using_memory = false;
+        }
+
+        // The tuner has returned to its idle state.
+        0x00 => {
+            match *atu_operation {
+                Some(AtuOperation::Tune) => {
+                    atu_state.status = sdroxide_types::AtuStatus::Tuned;
+                    atu_state.enabled = true;
+                    atu_state.using_memory = !*atu_saw_rf_request;
+                }
+                Some(AtuOperation::Bypass) => {
+                    atu_state.status = sdroxide_types::AtuStatus::Bypass;
+                    atu_state.enabled = false;
+                    atu_state.using_memory = false;
+                }
+                None if *atu_saw_rf_request => {
+                    atu_state.status = sdroxide_types::AtuStatus::Aborted;
+                    atu_state.using_memory = false;
+                }
+                None => {}
+            }
+
+            *atu_operation = None;
+            *atu_saw_rf_request = false;
+        }
+
+        // Terminal tuner fault codes.
+        0xFA..=0xFD => {
+            atu_state.status = sdroxide_types::AtuStatus::Failed;
+            atu_state.using_memory = false;
+            *atu_operation = None;
+            *atu_saw_rf_request = false;
+        }
+
+        // Other values are intermediate or currently unrecognised.
+        _ => {
+            tracing::debug!("HPSDR: unrecognised generic tuner status 0x{status:02X}");
+        }
+    }
+}
+
+/// Read an asynchronous tuner command result without blocking.
+fn receive_atu_command_reply(
+    reply: Option<&std::sync::mpsc::Receiver<HpsdrAtuCommandResult>>,
+) -> Option<HpsdrAtuCommandResult> {
+    match reply.map(|reply| reply.try_recv()) {
+        Some(Ok(result)) => Some(result),
+        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+            Some(HpsdrAtuCommandResult::Failed)
+        }
+        Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => None,
+    }
+}
+
+/// Apply the result of delivering a tuner command.
+fn apply_atu_command_result(
+    atu_state: &mut sdroxide_types::AtuState,
+    atu_operation: &mut Option<AtuOperation>,
+    atu_saw_rf_request: &mut bool,
+    result: HpsdrAtuCommandResult,
+) {
+    match result {
+        HpsdrAtuCommandResult::Acknowledged => {
+            tracing::debug!("HPSDR: antenna tuner command acknowledged by the Pico");
+            atu_state.command_error = None;
+        }
+
+        HpsdrAtuCommandResult::Rejected => {
+            tracing::warn!("HPSDR: antenna tuner command rejected before the I2C write");
+
+            *atu_operation = None;
+            *atu_saw_rf_request = false;
+
+            atu_state.status = sdroxide_types::AtuStatus::Failed;
+            atu_state.using_memory = false;
+            atu_state.command_error =
+                Some(sdroxide_types::AtuCommandError::Rejected);
+        }
+
+        HpsdrAtuCommandResult::Failed => {
+            tracing::warn!("HPSDR: antenna tuner I2C command failed or was not acknowledged");
+
+            *atu_operation = None;
+            *atu_saw_rf_request = false;
+
+            atu_state.status = sdroxide_types::AtuStatus::Failed;
+            atu_state.using_memory = false;
+            atu_state.command_error =
+                Some(sdroxide_types::AtuCommandError::DeliveryFailed);
+        }
+    }
+}
+
+/// Withdraw an active tuner status when its last update becomes stale.
+///
+/// Keep the pending operation and RF-request history so that a later
+/// fresh Reg7 status can still complete the operation.
+fn withdraw_stale_atu_status(
+    atu_state: &mut sdroxide_types::AtuState,
+    atu_operation: Option<AtuOperation>,
+    atu_saw_rf_request: bool,
+    updated_at: Option<Instant>,
+    now: Instant,
+) {
+    let stale = updated_at.is_some_and(|updated_at| {
+        now.checked_duration_since(updated_at)
+            .is_some_and(|age| age > TUNER_STATUS_MAX_AGE)
+    });
+
+    if !stale {
+        return;
+    }
+
+    atu_state.reg7_fresh = false;
+
+    if atu_operation.is_some() || atu_saw_rf_request {
+        atu_state.status = sdroxide_types::AtuStatus::Idle;
+        atu_state.using_memory = false;
+    }
+}
 
 fn dsp_div_mode(mode: sdroxide_types::DiversityMode) -> sdroxide_dsp::DiversityMode {
     match mode {
@@ -104,6 +253,18 @@ pub struct HpsdrSource {
     /// on every other board and configuration.
     io_rx_input: Option<sdroxide_types::HpsdrIoRxInput>,
 
+    // ── Generic antenna tuner ──
+    /// The operation currently being performed by the external tuner.
+    atu_operation: Option<AtuOperation>,
+    /// Receives the asynchronous result of the tuner I2C command.
+    atu_command_reply:
+        Option<std::sync::mpsc::Receiver<HpsdrAtuCommandResult>>,
+    /// Whether the tuner has requested RF during the current operation.
+    atu_saw_rf_request: bool,
+    /// Timestamp of the last tuner status processed.
+    atu_last_status_at: Option<Instant>,
+    /// State published to the radio interface.
+    atu_state: sdroxide_types::AtuState,
     // ── Diversity ──
     /// The combiner, present exactly when the board was asked for a synced DDC
     /// pair and agreed. Both aerials come out of [`HpsdrRx::rx_read_pair`]
@@ -314,6 +475,11 @@ impl HpsdrSource {
             ps_log_at: Instant::now(),
             ps_warned_offset: false,
             io_rx_input,
+            atu_operation: None,
+            atu_command_reply: None,
+            atu_saw_rf_request: false,
+            atu_last_status_at: None,
+            atu_state: sdroxide_types::AtuState::default(),
             diversity,
             aux_scratch: Vec::new(),
             aux_buf: Vec::new(),
@@ -436,17 +602,221 @@ impl HpsdrSource {
             }
         }
     }
+
+    /// Interpret a newly received generic tuner status byte.
+    fn observe_atu_status(&mut self, status: u8) {
+        observe_atu_status(
+            &mut self.atu_state,
+            &mut self.atu_operation,
+            &mut self.atu_saw_rf_request,
+            status,
+        );
+    }
+    /// Process the asynchronous result of delivering a tuner command.
+    /// An I2C acknowledgement confirms delivery, not completion.
+    fn poll_atu_command_reply(&mut self) {
+        let Some(result) =
+            receive_atu_command_reply(self.atu_command_reply.as_ref())
+        else {
+            return;
+        };
+
+        self.atu_command_reply = None;
+
+        apply_atu_command_result(
+            &mut self.atu_state,
+            &mut self.atu_operation,
+            &mut self.atu_saw_rf_request,
+            result,
+        );
+    }
+
+    /// Refresh the generic tuner state from the HPSDR status snapshot.
+    fn poll_atu_status(&mut self) {
+        self.poll_atu_command_reply();
+        let Some(rx) = self.rx.as_ref() else {
+            self.atu_state = sdroxide_types::AtuState::default();
+            self.atu_operation = None;
+            self.atu_command_reply = None;
+            self.atu_saw_rf_request = false;
+            self.atu_last_status_at = None;
+            return;
+        };
+
+        // The tuner is a board-level Protocol 1 accessory, available only
+        // through DDC 0 on boards equipped with an I/O Board.
+        let supported = rx.protocol() == 1
+            && rx.ddc() == 0
+            && self.board.as_ref().is_some_and(|board| board.has_io_board());
+
+        if !supported {
+            self.atu_state = sdroxide_types::AtuState::default();
+            self.atu_operation = None;
+            self.atu_command_reply = None;
+            self.atu_saw_rf_request = false;
+            self.atu_last_status_at = None;
+            return;
+        }
+
+        let snapshot = rx.tuner_status();
+
+        match snapshot.present {
+            Some(true) => {
+                self.atu_state.reg7_supported = true;
+            }
+            Some(false) => {
+                self.atu_state = sdroxide_types::AtuState::default();
+                self.atu_operation = None;
+                self.atu_command_reply = None;
+                self.atu_saw_rf_request = false;
+                self.atu_last_status_at = None;
+                return;
+            }
+            None => {
+                self.atu_state = sdroxide_types::AtuState::default();
+                self.atu_operation = None;
+                self.atu_command_reply = None;
+                self.atu_saw_rf_request = false;
+                self.atu_last_status_at = None;
+                return;
+            }
+        }
+
+        let Some(updated_at) = snapshot.updated_at else {
+            self.atu_state.reg7_fresh = false;
+
+            withdraw_stale_atu_status(
+                &mut self.atu_state,
+                self.atu_operation,
+                self.atu_saw_rf_request,
+                self.atu_last_status_at,
+                Instant::now(),
+            );
+            return;
+        };
+
+        let now = Instant::now();
+        let age = now.saturating_duration_since(updated_at);
+        self.atu_state.reg7_fresh = age <= TUNER_STATUS_MAX_AGE;
+
+        if !self.atu_state.reg7_fresh {
+            withdraw_stale_atu_status(
+                &mut self.atu_state,
+                self.atu_operation,
+                self.atu_saw_rf_request,
+                Some(updated_at),
+                now,
+            );
+            return;
+        }
+
+        let Some(status) = snapshot.raw_status else {
+            return;
+        };
+
+        // Process each published status snapshot only once.
+        if self.atu_last_status_at == Some(updated_at) {
+            return;
+        }
+
+        self.atu_last_status_at = Some(updated_at);
+        self.observe_atu_status(status);
+    }
+
+    /// Admit and queue a generic antenna tuner command.
+    fn queue_atu_command(&mut self, operation: AtuOperation) -> Result<()> {
+        // A second operation must not interrupt one already in progress.
+        if self.atu_operation.is_some() {
+            self.atu_state.command_error =
+                Some(sdroxide_types::AtuCommandError::Rejected);
+            return Err(RadioError::Msg(
+                "antenna tuner operation already in progress".into(),
+            ));
+        }
+
+        let Some(rx) = self.rx.as_ref() else {
+            self.atu_state.command_error =
+                Some(sdroxide_types::AtuCommandError::Rejected);
+            return Err(RadioError::Msg(
+                "antenna tuner is unavailable".into(),
+            ));
+        };
+
+        if rx.protocol() != 1
+            || rx.ddc() != 0
+            || !self.board.as_ref().is_some_and(|board| board.has_io_board())
+        {
+            self.atu_state.command_error =
+                Some(sdroxide_types::AtuCommandError::Rejected);
+            return Err(RadioError::Msg(
+                "antenna tuner is not supported by this HPSDR source".into(),
+            ));
+        }
+
+        let snapshot = rx.tuner_status();
+
+        let fresh = snapshot.updated_at.is_some_and(|updated_at| {
+            Instant::now().saturating_duration_since(updated_at)
+                <= TUNER_STATUS_MAX_AGE
+        });
+
+        let status_allows_command =
+            matches!(snapshot.raw_status, Some(0x00));
+
+        if snapshot.present != Some(true)
+            || !fresh
+            || !status_allows_command
+        {
+            self.atu_state.command_error =
+                Some(sdroxide_types::AtuCommandError::Rejected);
+            return Err(RadioError::Msg(
+                "antenna tuner is absent, busy, or has stale status".into(),
+            ));
+        }
+
+        let reply = match operation {
+            AtuOperation::Tune => rx.request_atu_tune(),
+            AtuOperation::Bypass => rx.request_atu_bypass(),
+        }
+        .ok_or_else(|| {
+            self.atu_state.command_error =
+                Some(sdroxide_types::AtuCommandError::DeliveryFailed);
+            RadioError::Msg("failed to queue antenna tuner command".into())
+        })?;
+
+        // Record the operation only after successfully queueing the command.
+        self.atu_operation = Some(operation);
+        self.atu_command_reply = Some(reply);
+        self.atu_saw_rf_request = false;
+        self.atu_last_status_at = snapshot.updated_at;
+        self.atu_state.command_error = None;
+
+        Ok(())
+    }
 }
 
 impl IqSource for HpsdrSource {
+    fn atu(&self) -> Option<sdroxide_types::AtuState> {
+        if self.atu_state.reg7_supported {
+            Some(self.atu_state.clone())
+        } else {
+            None
+        }
+    }
+
     fn sample_rate(&self) -> f64 {
         self.sample_rate_hz()
     }
-
     fn center_hz(&self) -> f64 {
         self.center
     }
+    fn atu_tune(&mut self) -> Result<()> {
+        self.queue_atu_command(AtuOperation::Tune)
+    }
 
+    fn atu_bypass(&mut self) -> Result<()> {
+        self.queue_atu_command(AtuOperation::Bypass)
+    }
     fn set_center_hz(&mut self, hz: f64) -> Result<()> {
         self.center = hz;
         if let Some(rx) = self.rx.as_ref() {
@@ -622,6 +992,7 @@ impl IqSource for HpsdrSource {
         Ok(())
     }
 
+
     fn current_gains(&self) -> Vec<(String, f64)> {
         match self.rx.as_ref() {
             Some(rx) if rx.has_lna_gain() => {
@@ -672,6 +1043,8 @@ impl IqSource for HpsdrSource {
     /// Only changes are reported. A released stream answers `false`, which
     /// unkeys rather than leaving an over hanging on a line nobody is reading.
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
+        self.poll_atu_status();
+
         let ptt = self.rx.as_ref().is_some_and(|rx| rx.radio_ptt());
         if ptt == self.ptt {
             return Vec::new();
@@ -774,5 +1147,249 @@ impl IqSource for HpsdrSource {
     /// the network.
     fn tx_pace_cushion_ms(&self) -> f64 {
         self.tx_latency_ms
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn initial_state() -> sdroxide_types::AtuState {
+        sdroxide_types::AtuState::default()
+    }
+
+    #[test]
+    fn tune_with_rf_request_completes_successfully() {
+        let mut state = initial_state();
+        let mut operation = Some(AtuOperation::Tune);
+        let mut saw_rf = false;
+
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0xEE);
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Tuning);
+        assert!(state.enabled);
+        assert!(!state.using_memory);
+
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0x00);
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Tuned);
+        assert!(state.enabled);
+        assert!(!state.using_memory);
+        assert_eq!(operation, None);
+        assert!(!saw_rf);
+    }
+
+    #[test]
+    fn tune_using_memory_completes_successfully() {
+        let mut state = initial_state();
+        let mut operation = Some(AtuOperation::Tune);
+        let mut saw_rf = false;
+
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0x00);
+
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Tuned);
+        assert!(state.enabled);
+        assert!(state.using_memory);
+        assert_eq!(operation, None);
+    }
+
+    #[test]
+    fn bypass_completes_successfully() {
+        let mut state = initial_state();
+        let mut operation = Some(AtuOperation::Bypass);
+        let mut saw_rf = false;
+
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0x00);
+
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Bypass);
+        assert!(!state.enabled);
+        assert!(!state.using_memory);
+        assert_eq!(operation, None);
+    }
+
+    #[test]
+    fn unsolicited_idle_after_rf_request_is_aborted() {
+        let mut state = initial_state();
+        let mut operation = None;
+        let mut saw_rf = false;
+
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0xEE);
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0x00);
+
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Aborted);
+        assert!(!state.using_memory);
+        assert!(!saw_rf);
+    }
+
+    #[test]
+    fn terminal_fault_clears_operation_and_memory_state() {
+        let mut state = initial_state();
+        let mut operation = Some(AtuOperation::Tune);
+        let mut saw_rf = true;
+
+        state.using_memory = true;
+
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0xFA);
+
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Failed);
+        assert!(!state.using_memory);
+        assert_eq!(operation, None);
+        assert!(!saw_rf);
+    }
+
+    #[test]
+    fn intermediate_status_does_not_complete_operation() {
+        let mut state = initial_state();
+        let mut operation = Some(AtuOperation::Tune);
+        let mut saw_rf = false;
+
+        observe_atu_status(&mut state, &mut operation, &mut saw_rf, 0x05);
+
+        assert_eq!(operation, Some(AtuOperation::Tune));
+        assert_eq!(state.reg7_status, Some(0x05));
+        assert!(state.reg7_fresh);
+    }
+
+    #[test]
+    fn stale_status_withdraws_display_but_preserves_operation() {
+        let mut state = initial_state();
+        state.status = sdroxide_types::AtuStatus::Tuning;
+        state.reg7_fresh = true;
+        state.using_memory = true;
+
+        let operation = Some(AtuOperation::Tune);
+        let saw_rf = true;
+        let now = Instant::now();
+        let updated_at = now - TUNER_STATUS_MAX_AGE - Duration::from_millis(1);
+
+        withdraw_stale_atu_status(
+            &mut state,
+            operation,
+            saw_rf,
+            Some(updated_at),
+            now,
+        );
+
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Idle);
+        assert!(!state.reg7_fresh);
+        assert!(!state.using_memory);
+
+        // The operation context must survive the stale interval.
+        assert_eq!(operation, Some(AtuOperation::Tune));
+        assert!(saw_rf);
+    }
+
+    #[test]
+    fn fresh_status_is_not_withdrawn() {
+        let mut state = initial_state();
+        state.status = sdroxide_types::AtuStatus::Tuning;
+        state.reg7_fresh = true;
+
+        let now = Instant::now();
+        let updated_at = now - Duration::from_millis(100);
+
+        withdraw_stale_atu_status(
+            &mut state,
+            Some(AtuOperation::Tune),
+            true,
+            Some(updated_at),
+            now,
+        );
+
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Tuning);
+        assert!(state.reg7_fresh);
+    }
+
+    #[test]
+    fn stale_status_without_active_operation_only_marks_not_fresh() {
+        let mut state = initial_state();
+        state.status = sdroxide_types::AtuStatus::Tuned;
+        state.reg7_fresh = true;
+        state.using_memory = true;
+
+        let now = Instant::now();
+        let updated_at = now - TUNER_STATUS_MAX_AGE - Duration::from_millis(1);
+
+        withdraw_stale_atu_status(
+            &mut state,
+            None,
+            false,
+            Some(updated_at),
+            now,
+        );
+
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Tuned);
+        assert!(!state.reg7_fresh);
+        assert!(state.using_memory);
+    }
+    #[test]
+    fn command_acknowledgement_retains_pending_operation() {
+        let mut state = initial_state();
+        state.command_error = Some(sdroxide_types::AtuCommandError::Rejected);
+
+        let mut operation = Some(AtuOperation::Tune);
+        let mut saw_rf = true;
+
+        apply_atu_command_result(
+            &mut state,
+            &mut operation,
+            &mut saw_rf,
+            HpsdrAtuCommandResult::Acknowledged,
+        );
+
+        assert_eq!(operation, Some(AtuOperation::Tune));
+        assert!(saw_rf);
+        assert_eq!(state.command_error, None);
+    }
+
+    #[test]
+    fn command_rejection_clears_operation() {
+        let mut state = initial_state();
+        let mut operation = Some(AtuOperation::Tune);
+        let mut saw_rf = true;
+
+        apply_atu_command_result(
+            &mut state,
+            &mut operation,
+            &mut saw_rf,
+            HpsdrAtuCommandResult::Rejected,
+        );
+
+        assert_eq!(operation, None);
+        assert!(!saw_rf);
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Failed);
+        assert_eq!(
+            state.command_error,
+            Some(sdroxide_types::AtuCommandError::Rejected)
+        );
+    }
+
+    #[test]
+    fn command_delivery_failure_clears_operation() {
+        let mut state = initial_state();
+        let mut operation = Some(AtuOperation::Bypass);
+        let mut saw_rf = true;
+
+        apply_atu_command_result(
+            &mut state,
+            &mut operation,
+            &mut saw_rf,
+            HpsdrAtuCommandResult::Failed,
+        );
+
+        assert_eq!(operation, None);
+        assert!(!saw_rf);
+        assert_eq!(state.status, sdroxide_types::AtuStatus::Failed);
+        assert_eq!(
+            state.command_error,
+            Some(sdroxide_types::AtuCommandError::DeliveryFailed)
+        );
+    }
+
+    #[test]
+    fn disconnected_command_reply_is_delivery_failure() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+
+        let result = receive_atu_command_reply(Some(&receiver));
+
+        assert_eq!(result, Some(HpsdrAtuCommandResult::Failed));
     }
 }

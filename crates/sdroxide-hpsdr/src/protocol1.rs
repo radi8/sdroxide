@@ -722,23 +722,25 @@ pub(crate) fn run(ctx: ThreadCtx) {
                         b.set_rx_input(input);
                     }
                 }
-                Ctrl::AtuTune => {
+                Ctrl::AtuTune(reply) => {
                     if let Some(b) = io_board.as_mut() {
-                        if !b.request_tune(Instant::now()) {
+                        if !b.request_tune(Instant::now(), reply) {
                             tracing::warn!("HPSDR P1: antenna tuner tune request rejected");
                         }
                     } else {
+                        let _ = reply.send(crate::net::HpsdrAtuCommandResult::Rejected);
                         tracing::warn!(
                             "HPSDR P1: antenna tuner tune request ignored; no I/O board"
                         );
                     }
                 }
-                Ctrl::AtuBypass => {
+                Ctrl::AtuBypass(reply) => {
                     if let Some(b) = io_board.as_mut() {
-                        if !b.request_bypass(Instant::now()) {
+                        if !b.request_bypass(Instant::now(), reply) {
                             tracing::warn!("HPSDR P1: antenna tuner bypass request rejected");
                         }
                     } else {
+                        let _ = reply.send(crate::net::HpsdrAtuCommandResult::Rejected);
                         tracing::warn!(
                             "HPSDR P1: antenna tuner bypass request ignored; no I/O board"
                         );

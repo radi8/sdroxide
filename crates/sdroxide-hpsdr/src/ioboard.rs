@@ -226,6 +226,10 @@ pub(crate) struct IoBoard {
     tuner_status_poll_at: Option<Instant>,
     /// True while a TUNE or BYPASS write is awaiting its I2C ACK.
     tuner_command_pending: bool,
+    /// Sends the eventual result of the pending tuner I2C write.
+    tuner_command_reply: Option<
+        std::sync::mpsc::Sender<crate::net::HpsdrAtuCommandResult>,
+    >,
     /// Which input the operator has wired the board for, stated once after the
     /// reset. Only the connection knows this; the board itself comes up at 0.
     rx_input: HpsdrIoRxInput,
@@ -256,6 +260,7 @@ impl IoBoard {
             tuner_status: None,
             tuner_status_poll_at: None,
             tuner_command_pending: false,
+            tuner_command_reply: None,
             rx_input,
             inflight: None,
             queue: VecDeque::new(),
@@ -288,16 +293,64 @@ impl IoBoard {
 
     /// Request a generic tuner tune operation.
     ///
-    /// The request is accepted only when a tuner is positively detected,
-    /// its latest status is fresh and exactly idle (0x00), and no tuner
-    /// command is already awaiting acknowledgement.
-    pub(crate) fn request_tune(&mut self, now: Instant) -> bool {
-        self.request_tuner_command(TUNER_CMD_TUNE, now)
+    /// The reply reports I2C delivery, not completion of the tuning operation.
+    pub(crate) fn request_tune(
+        &mut self,
+        now: Instant,
+        reply: std::sync::mpsc::Sender<crate::net::HpsdrAtuCommandResult>,
+    ) -> bool {
+        self.request_tuner_command(TUNER_CMD_TUNE, now, reply)
     }
 
     /// Request generic tuner bypass.
-    pub(crate) fn request_bypass(&mut self, now: Instant) -> bool {
-        self.request_tuner_command(TUNER_CMD_BYPASS, now)
+    pub(crate) fn request_bypass(
+        &mut self,
+        now: Instant,
+        reply: std::sync::mpsc::Sender<crate::net::HpsdrAtuCommandResult>,
+    ) -> bool {
+        self.request_tuner_command(TUNER_CMD_BYPASS, now, reply)
+    }
+
+    fn request_tuner_command(
+        &mut self,
+        command: u8,
+        now: Instant,
+        reply: std::sync::mpsc::Sender<crate::net::HpsdrAtuCommandResult>,
+    ) -> bool {
+        use crate::net::HpsdrAtuCommandResult;
+
+        let tuner_present =
+            matches!(self.tuner_discovery, TunerDiscovery::Complete { present: true, .. });
+
+        let status_is_idle_and_fresh = self.tuner_status.is_some_and(|(status, received_at)| {
+            status == 0x00
+                && now
+                    .checked_duration_since(received_at)
+                    .is_some_and(|age| age <= TUNER_STATUS_MAX_AGE)
+        });
+
+        if !tuner_present || !status_is_idle_and_fresh || self.tuner_command_pending {
+            tracing::debug!(
+                "HL2IOBoard: tuner command 0x{command:02X} rejected \
+                 (present={tuner_present}, status={:?}, pending={})",
+                self.tuner_status.map(|(status, _)| status),
+                self.tuner_command_pending
+            );
+            let _ = reply.send(HpsdrAtuCommandResult::Rejected);
+            return false;
+        }
+
+        self.queue.push_back(Op::write(REG_ANTENNA_TUNER, command));
+        self.tuner_command_pending = true;
+        self.tuner_command_reply = Some(reply);
+
+        // The old idle status must not authorise another command. A fresh
+        // status read is required after this command has been acknowledged.
+        self.tuner_status = None;
+        self.tuner_status_poll_at = None;
+
+        tracing::info!("HL2IOBoard: tuner command 0x{command:02X} queued");
+        true
     }
 
     /// Return the current tuner discovery and status snapshot.
@@ -317,39 +370,6 @@ impl IoBoard {
             raw_status,
             updated_at,
         }
-    }
-
-    fn request_tuner_command(&mut self, command: u8, now: Instant) -> bool {
-        let tuner_present =
-            matches!(self.tuner_discovery, TunerDiscovery::Complete { present: true, .. });
-
-        let status_is_idle_and_fresh = self.tuner_status.is_some_and(|(status, received_at)| {
-            status == 0x00
-                && now
-                    .checked_duration_since(received_at)
-                    .is_some_and(|age| age <= TUNER_STATUS_MAX_AGE)
-        });
-
-        if !tuner_present || !status_is_idle_and_fresh || self.tuner_command_pending {
-            tracing::debug!(
-                "HL2IOBoard: tuner command 0x{command:02X} rejected \
-                 (present={tuner_present}, status={:?}, pending={})",
-                self.tuner_status.map(|(status, _)| status),
-                self.tuner_command_pending
-            );
-            return false;
-        }
-
-        self.queue.push_back(Op::write(REG_ANTENNA_TUNER, command));
-        self.tuner_command_pending = true;
-
-        // The old idle status must not authorise another command. A fresh
-        // status read is required after this command has been acknowledged.
-        self.tuner_status = None;
-        self.tuner_status_poll_at = None;
-
-        tracing::info!("HL2IOBoard: tuner command 0x{command:02X} queued");
-        true
     }
 
     /// The C&C block to put in this datagram, or `None` to leave the slot to the
@@ -632,6 +652,9 @@ impl IoBoard {
             && matches!(f.op.data, TUNER_CMD_TUNE | TUNER_CMD_BYPASS)
         {
             self.tuner_command_pending = false;
+            if let Some(reply) = self.tuner_command_reply.take() {
+                let _ = reply.send(crate::net::HpsdrAtuCommandResult::Acknowledged);
+            }
             self.tuner_status = None;
             self.tuner_status_poll_at = Some(now);
         }
@@ -672,6 +695,9 @@ impl IoBoard {
         {
             if op.cookie == I2C_WRITE && matches!(op.data, TUNER_CMD_TUNE | TUNER_CMD_BYPASS) {
                 self.tuner_command_pending = false;
+                if let Some(reply) = self.tuner_command_reply.take() {
+                    let _ = reply.send(crate::net::HpsdrAtuCommandResult::Failed);
+                }
             }
 
             self.tuner_status = None;
@@ -815,6 +841,13 @@ mod tests {
             board.tuner_discovery,
             TunerDiscovery::Complete { present: false, .. }
         ));
+    }
+
+    fn tuner_reply_channel() -> (
+        std::sync::mpsc::Sender<crate::net::HpsdrAtuCommandResult>,
+        std::sync::mpsc::Receiver<crate::net::HpsdrAtuCommandResult>,
+    ) {
+        std::sync::mpsc::channel()
     }
 
     #[test]
@@ -1239,11 +1272,17 @@ mod tests {
 
         request_tuner_discovery(&mut board, now);
         ack(&mut board, now, [9, 7, TUNER_PRESENT, 0]);
-        assert!(board.request_tune(now));
+        let (reply, _result) = tuner_reply_channel();
+        assert!(board.request_tune(now, reply));
         assert!(board.tuner_command_pending);
 
         // A second command cannot be accepted while the first is pending.
-        assert!(!board.request_bypass(now));
+        let (reply, result) = tuner_reply_channel();
+        assert!(!board.request_bypass(now, reply));
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Rejected
+        );
     }
 
     #[test]
@@ -1253,7 +1292,12 @@ mod tests {
 
         request_tuner_discovery(&mut board, now);
         ack(&mut board, now, [9, 7, TUNER_PRESENT, 0x04]);
-        assert!(!board.request_tune(now));
+        let (reply, result) = tuner_reply_channel();
+        assert!(!board.request_tune(now, reply));
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Rejected
+        );
         assert!(!board.tuner_command_pending);
     }
 
@@ -1265,9 +1309,15 @@ mod tests {
         request_tuner_discovery(&mut board, now);
         ack(&mut board, now, [9, 7, TUNER_PRESENT, 0]);
 
+        let (reply, result) = tuner_reply_channel();
         assert!(!board.request_tune(
-            now + TUNER_STATUS_MAX_AGE + Duration::from_millis(1)
+            now + TUNER_STATUS_MAX_AGE + Duration::from_millis(1),
+            reply
         ));
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Rejected
+        );
     }
 
     #[test]
@@ -1278,7 +1328,8 @@ mod tests {
         request_tuner_discovery(&mut board, now);
         ack(&mut board, now, [9, 7, TUNER_PRESENT, 0]);
 
-        assert!(board.request_tune(now));
+        let (reply, result) = tuner_reply_channel();
+        assert!(board.request_tune(now, reply));
 
         let command = board.next_request(now, RX_HZ, RX_HZ, 0).expect("tune command");
         assert_eq!(
@@ -1288,6 +1339,10 @@ mod tests {
 
         ack(&mut board, now, [0; 4]);
 
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Acknowledged
+        );
         assert!(!board.tuner_command_pending);
         assert_eq!(board.tuner_status, None);
 
@@ -1296,5 +1351,34 @@ mod tests {
             .next_request(now, RX_HZ, RX_HZ, 0)
             .expect("post-command status read");
         assert_eq!((poll[1], poll[3]), (I2C_READ, REG_ANTENNA_TUNER));
+    }
+
+    #[test]
+    fn tuner_command_i2c_failure_returns_failed_result() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+
+        request_tuner_discovery(&mut board, now);
+        ack(&mut board, now, [9, 7, TUNER_PRESENT, 0]);
+
+        let (reply, result) = tuner_reply_channel();
+        assert!(board.request_tune(now, reply));
+        assert!(board.tuner_command_pending);
+
+        let command = board.next_request(now, RX_HZ, RX_HZ, 0).expect("tune command");
+        assert_eq!(
+            (command[1], command[3], command[4]),
+            (I2C_WRITE, REG_ANTENNA_TUNER, TUNER_CMD_TUNE)
+        );
+
+        // Simulate the Hermes-Lite reporting an I2C transaction failure.
+        board.on_ack(RADDR_ERROR, [0; 4], now);
+
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Failed
+        );
+        assert!(!board.tuner_command_pending);
+        assert!(board.tuner_command_reply.is_none());
     }
 }

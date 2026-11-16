@@ -333,25 +333,7 @@ pub trait IqSource: Send {
     fn commands_rig_power(&self) -> bool {
         false
     }
-    /// Whether this radio has a separate *receiving* antenna connector, and
-    /// whether it is switched into the receive path.
-    ///
-    /// `None` — the default — where it has none, or has not said yet, which is
-    /// every SDR: a board's ports are a choice between sockets, not an extra
-    /// input switched in alongside the one the transmitter uses. `Some`
-    /// becomes `DeviceCaps::has_rx_antenna` (that there is one) and
-    /// `RadioState::rx_antenna` (which way it is set).
-    ///
-    /// Asked on every pass of the engine loop, like [`Self::learned_antennas`],
-    /// so it must not allocate or take a lock that anything else holds for
-    /// long.
-    /// Current external tuner state, or None until a tuner is positively detected.
-    fn atu(&self) -> Option<sdroxide_types::AtuState> {
-        None
-    }
-    /// Request tuner matching through the standard host transmit path.
-    fn atu_tune(&mut self) -> Result<()> {
-        Ok(())
+
     /// Current external tuner state, or None until a tuner is positively detected.
     fn atu(&self) -> Option<sdroxide_types::AtuState> {
         None
