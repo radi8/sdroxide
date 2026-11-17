@@ -1266,6 +1266,85 @@ mod tests {
     }
 
     #[test]
+    fn tuner_commands_are_rejected_until_discovery_completes() {
+        let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
+        let now = Instant::now();
+
+        find(&mut board, now);
+
+        // Acknowledge the normal board reset.
+        let reset = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("board reset");
+        assert_eq!((reset[3], reset[4]), (REG_CONTROL, 1));
+        ack(&mut board, now, [0; 4]);
+
+        // Discovery command has been queued, but not yet acknowledged.
+        let discover = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("discovery command");
+        assert_eq!(
+            (discover[3], discover[4]),
+            (REG_ANTENNA_TUNER, TUNER_DISCOVER)
+        );
+        assert_eq!(
+            board.tuner_discovery,
+            TunerDiscovery::AwaitingCommandAck
+        );
+
+        // Neither Tune nor Bypass may be issued at this stage.
+        let (reply, result) = tuner_reply_channel();
+        assert!(!board.request_tune(now, reply));
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Rejected
+        );
+
+        let (reply, result) = tuner_reply_channel();
+        assert!(!board.request_bypass(now, reply));
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Rejected
+        );
+
+        // Acknowledge discovery command. The response is still pending.
+        ack(&mut board, now, [0; 4]);
+
+        let read = board
+            .next_request(now, RX_HZ, RX_HZ, 0)
+            .expect("discovery response read");
+        assert_eq!((read[1], read[3]), (I2C_READ, REG_ANTENNA_TUNER));
+        assert_eq!(
+            board.tuner_discovery,
+            TunerDiscovery::AwaitingResponse
+        );
+        assert_eq!(board.status_snapshot().present, None);
+
+        // Both commands must remain blocked while the Pico reports pending.
+        let (reply, result) = tuner_reply_channel();
+        assert!(!board.request_tune(now, reply));
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Rejected
+        );
+
+        let (reply, result) = tuner_reply_channel();
+        assert!(!board.request_bypass(now, reply));
+        assert_eq!(
+            result.recv().unwrap(),
+            crate::net::HpsdrAtuCommandResult::Rejected
+        );
+
+        // No actual tuner command may have entered the I2C queue.
+        assert!(!board.queue.iter().any(|op| {
+            op.cookie == I2C_WRITE
+                && op.reg == REG_ANTENNA_TUNER
+                && matches!(op.data, TUNER_CMD_TUNE | TUNER_CMD_BYPASS)
+        }));
+        assert!(!board.tuner_command_pending);
+    }
+
+    #[test]
     fn tuner_commands_require_a_fresh_idle_status() {
         let mut board = IoBoard::new(HpsdrIoRxInput::Radio);
         let now = Instant::now();

@@ -4143,6 +4143,9 @@ struct Engine {
     /// from the tuning about inside a band that goes on all session. See
     /// [`Engine::poll_band_change`].
     band_seen: Band,
+    /// A band change has requested an ATU bypass which has not yet
+    /// been accepted by the source.
+    atu_bypass_pending: bool,
     /// Built-in TCI server: third-party clients (WSJT-X, JTDX, skimmers)
     /// driving this radio. Present while enabled and successfully bound.
     tci_srv: Option<TciServerController>,
@@ -5576,6 +5579,7 @@ fn engine_thread(
         // top to bottom and the `state` shorthand below moves it, so the band
         // has to be copied out of it first.
         band_seen: state.band,
+        atu_bypass_pending: false,
         // Read before `state` is moved below, for the same reason `band_seen`
         // is: the stream starts wherever the front end already was.
         stream_center_hz: state.center_hz,
@@ -6270,6 +6274,7 @@ fn engine_thread(
         engine.poll_tci_server();
         engine.poll_rigctld();
         engine.poll_band_change();
+        engine.poll_pending_atu_bypass();
         engine.wsjtx_heartbeat();
         engine.poll_spots();
         engine.poll_winlink();
@@ -8677,6 +8682,11 @@ impl Engine {
         // goes through, so a QSY made at the radio's own front panel counts
         // too. The answer arrives as `ControlUpdate::RxAntenna`.
         self.source.reread_rx_antenna();
+        // A band change requires the external tuner to be bypassed.
+        // The request is deferred until the radio and tuner are ready.
+        if self.caps.has_atu && self.state.atu.reg7_supported {
+            self.atu_bypass_pending = true;
+        }
         if self.state.rx[0].mode.is_wspr() {
             return;
         }
@@ -8696,6 +8706,41 @@ impl Engine {
         // out of.
         if let Some(w) = &self.wsjtx {
             w.clear();
+        }
+    }
+
+    /// Submit a deferred tuner bypass once the radio and tuner are ready.
+    fn poll_pending_atu_bypass(&mut self) {
+        if !self.atu_bypass_pending {
+            return;
+        }
+
+        // Discard the request if the tuner is no longer available.
+        if !self.caps.has_atu || !self.state.atu.reg7_supported {
+            self.atu_bypass_pending = false;
+            return;
+        }
+
+        // Do not change the tuner configuration while transmitting or
+        // while a PTT request is active.
+        //
+        // Require a fresh idle status from the Pico. Reg7 returns to zero
+        // after both a successful Tune and a successful Bypass.
+        if !atu_bypass_ready(
+            self.caps.has_atu,
+            self.state.atu.reg7_supported,
+            self.state.atu.reg7_fresh,
+            self.state.atu.reg7_status,
+            self.on_air(),
+            self.state.tx.ptt,
+        ) {
+            return;
+        }
+
+        // Clear the pending request only when the source accepts it.
+        // If admission fails, leave it pending for a later retry.
+        if self.source.atu_bypass().is_ok() {
+            self.atu_bypass_pending = false;
         }
     }
 
@@ -13102,10 +13147,46 @@ impl Engine {
                 return;
             }
 
-            // Stage 1 adds the generic command vocabulary; actual tuner
-            // command handling is added with the HPSDR transport/interlock stages.
-            AtuTune | AtuBypass => {
-                self.notice("Antenna-tuner controls are not available yet.");
+            AtuTune => {
+                if !self.caps.has_atu || !self.state.atu.reg7_supported {
+                    self.notice("No supported antenna tuner is available.");
+                    return;
+                }
+
+                if self.on_air() || self.state.tx.ptt {
+                    self.notice("Wait for the transmission to finish before tuning.");
+                    return;
+                }
+
+                match self.source.atu_tune() {
+                    Ok(()) => self.notice("Antenna-tuner tune command submitted."),
+                    Err(e) => {
+                        self.notice(&format!("Could not start antenna-tuner tuning: {e}"));
+                    }
+                }
+                return;
+            }
+
+            AtuBypass => {
+                if !self.caps.has_atu || !self.state.atu.reg7_supported {
+                    self.notice("No supported antenna tuner is available.");
+                    return;
+                }
+
+                if self.on_air() || self.state.tx.ptt {
+                    self.notice("Wait for the transmission to finish before bypassing the tuner.");
+                    return;
+                }
+
+                match self.source.atu_bypass() {
+                    Ok(()) => {
+                        self.atu_bypass_pending = false;
+                        self.notice("Antenna-tuner bypass command submitted.");
+                    }
+                    Err(e) => {
+                        self.notice(&format!("Could not bypass the antenna tuner: {e}"));
+                    }
+                }
                 return;
             }
 
@@ -23421,6 +23502,22 @@ fn free_image_name(dir: &std::path::Path, kind: &str, ts: u128) -> String {
     name
 }
 
+fn atu_bypass_ready(
+    has_atu: bool,
+    reg7_supported: bool,
+    reg7_fresh: bool,
+    reg7_status: Option<u8>,
+    on_air: bool,
+    ptt: bool,
+) -> bool {
+    has_atu
+        && reg7_supported
+        && reg7_fresh
+        && reg7_status == Some(0x00)
+        && !on_air
+        && !ptt
+}
+
 #[cfg(test)]
 mod image_name_tests {
     use super::free_image_name;
@@ -26161,5 +26258,58 @@ mod decode_feed_tests {
         assert_eq!(&buf[..n], want.as_bytes());
         // An empty address is no feed at all, which is the default.
         assert!(DecodeFeed::new("   ").is_none());
+    }
+}
+#[cfg(test)]
+mod atu_bypass_tests {
+    use super::atu_bypass_ready;
+
+    #[test]
+    fn no_tuner_is_not_ready() {
+        assert!(!atu_bypass_ready(
+            false, true, true, Some(0x00), false, false
+        ));
+    }
+
+    #[test]
+    fn unsupported_reg7_is_not_ready() {
+        assert!(!atu_bypass_ready(
+            true, false, true, Some(0x00), false, false
+        ));
+    }
+
+    #[test]
+    fn stale_reg7_is_not_ready() {
+        assert!(!atu_bypass_ready(
+            true, true, false, Some(0x00), false, false
+        ));
+    }
+
+    #[test]
+    fn non_idle_reg7_is_not_ready() {
+        assert!(!atu_bypass_ready(
+            true, true, true, Some(0x04), false, false
+        ));
+    }
+
+    #[test]
+    fn transmitting_is_not_ready() {
+        assert!(!atu_bypass_ready(
+            true, true, true, Some(0x00), true, false
+        ));
+    }
+
+    #[test]
+    fn ptt_active_is_not_ready() {
+        assert!(!atu_bypass_ready(
+            true, true, true, Some(0x00), false, true
+        ));
+    }
+
+    #[test]
+    fn fresh_idle_status_when_not_transmitting_is_ready() {
+        assert!(atu_bypass_ready(
+            true, true, true, Some(0x00), false, false
+        ));
     }
 }
