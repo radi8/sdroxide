@@ -1912,7 +1912,6 @@ topbar-diversity-filter-which-way-combines = Het diversity-filter: hoe het de tw
 topbar-diversity = DIVERSITY
 topbar-second-receiver-s-frequency-mode = Frequentie, modus, filter en niveau van de tweede ontvanger
 topbar-sub-receiver = SUBONTVANGER
-topbar-transceiver-s-own-aerial-socket = De eigen antenne-aansluiting van de transceiver en de aan/uit-schakelaar
 topbar-radio = RADIO
 topbar-tune-voice-keyer-drive-mic = Tune, de voice keyer en de drive- en microfoonniveaus
 topbar-transmit = ZENDEN

@@ -1912,7 +1912,6 @@ topbar-diversity-filter-which-way-combines = Le filtre de diversité : dans quel
 topbar-diversity = DIVERSITÉ
 topbar-second-receiver-s-frequency-mode = La fréquence, le mode, le filtre et le niveau du second récepteur
 topbar-sub-receiver = SOUS-RÉCEPTEUR
-topbar-transceiver-s-own-aerial-socket = La prise antenne propre à l'émetteur-récepteur, et son interrupteur d'alimentation
 topbar-radio = RADIO
 topbar-tune-voice-keyer-drive-mic = Accord, le manipulateur vocal, et les niveaux d'excitation et de micro
 topbar-transmit = ÉMISSION

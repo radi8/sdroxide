@@ -1914,7 +1914,6 @@ topbar-diversity-filter-which-way-combines = Çeşitlilik filtresi: iki anteni h
 topbar-diversity = ÇEŞİTLİLİK
 topbar-second-receiver-s-frequency-mode = İkinci alıcının frekansı, modu, filtresi ve seviyesi
 topbar-sub-receiver = ALT ALICI
-topbar-transceiver-s-own-aerial-socket = Telsizin kendi anten soketi ve güç anahtarı
 topbar-radio = RADYO
 topbar-tune-voice-keyer-drive-mic = Ayar, sesli keyer ve sürüş ve mikrofon seviyeleri
 topbar-transmit = YAYIN

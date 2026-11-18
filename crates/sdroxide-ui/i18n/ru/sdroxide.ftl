@@ -1920,7 +1920,6 @@ topbar-diversity-filter-which-way-combines = Диверсифицирующий 
 topbar-diversity = DIVERSITY
 topbar-second-receiver-s-frequency-mode = Частота, режим, фильтр и уровень второго приёмника
 topbar-sub-receiver = ДОП. ПРИЁМНИК
-topbar-transceiver-s-own-aerial-socket = Собственный антенный разъём трансивера и его выключатель питания
 topbar-radio = РАДИО
 topbar-tune-voice-keyer-drive-mic = Настройка, голосовой манипулятор, а также уровни Drive и микрофона
 topbar-transmit = ПЕРЕДАЧА

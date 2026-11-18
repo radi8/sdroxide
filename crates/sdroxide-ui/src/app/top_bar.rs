@@ -49,6 +49,10 @@ const LINK_GAP: f32 = 4.0;
 /// What the RIG box's receiving-antenna chip says, in the one place the width
 /// measurement and the chip itself both read it from.
 const RX_ANT_LABEL: &str = "RX ANT";
+/// Labels for the radio's generic antenna-tuner controls.
+const ATU_TUNE_LABEL: &str = "TUNE";
+const ATU_TUNING_LABEL: &str = "TUNING";
+const ATU_BYPASS_LABEL: &str = "BYP";
 /// Width of the frequency box's right column (inactive VFO + band/mode chip).
 const RIGHT_W: f32 = 96.0;
 /// Width of the S-meter box at its design size. It has no ceiling: the bar and
@@ -1490,10 +1494,10 @@ impl SdroxideApp {
         });
     }
 
-    /// The RIG menu, shown only on a radio with an aerial selector or a power
-    /// switch this end can reach.
+    /// The RIG menu, shown when this end can reach an antenna selector,
+    /// antenna tuner or radio power switch.
     fn rig_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
-        let btn = btn.on_hover_text(tr!("topbar-transceiver-s-own-aerial-socket"));
+        let btn = btn.on_hover_text(tr!("topbar-radio-hardware-controls"));
         crate::chrome::menu_popup(ui, &btn, |ui| {
             crate::chrome::menu_caption(ui, &tr!("topbar-radio"));
             self.rig_controls(ui, cmds, true);
@@ -5236,38 +5240,67 @@ impl SdroxideApp {
     fn rig_rx_antenna(&self) -> Option<bool> {
         self.caps.as_ref().filter(|c| c.has_rx_antenna).map(|_| self.state.rx_antenna)
     }
-
+    /// The radio's antenna tuner and its reported state, or None where
+    /// no tuner is available.
+    fn rig_atu(&self) -> Option<sdroxide_types::AtuState> {
+        self.caps.as_ref().filter(|c| c.has_atu).map(|_| self.state.atu)
+    }
+    /// Whether the tuner shares the antenna row rather than needing
+    /// a row of its own.
+    fn atu_in_ant_row(&self) -> bool {
+        (!self.rig_antennas().is_empty() || self.rig_rx_antenna().is_some())
+            && self.rig_power()
+    }
     /// Whether the RIG box has anything to carry. Like DIV and SUB, it appears
     /// only for hardware that has what it drives — a strip is too narrow to
     /// hold controls for a radio that would ignore them.
     fn rig_box_shown(&self) -> bool {
-        !self.rig_antennas().is_empty() || self.rig_rx_antenna().is_some() || self.rig_power()
+        !self.rig_antennas().is_empty()
+            || self.rig_rx_antenna().is_some()
+            || self.rig_power()
+            || self.rig_atu().is_some()
     }
-
     /// The RIG box's natural width: the wider of its two rows.
     fn rig_rows_w(&self, ui: &egui::Ui) -> f32 {
         let gap = MODULE_ROW_SPACING;
         let body = egui::TextStyle::Body.resolve(ui.style());
         let ants = self.rig_antennas();
-        // The aerial row: the label, the socket chip where there is a choice of
-        // sockets, and the receiving antenna's own chip where there is one.
-        // Both are optional and either may be alone — an IC-7300MK2 has one
-        // socket and a receiving antenna, an IC-7700 the other way about.
+
         let mut top = 0.0f32;
+
         if !ants.is_empty() {
-            // The chip wears whichever socket the radio is on, so the box has
-            // to be as wide as the longest of them or it would resize as the
-            // operator switched.
             let widest =
                 ants.iter().fold(0.0f32, |a, n| a.max(crate::chrome::chip_width(ui, n, None)));
             top += gap + widest;
         }
+
         if self.rig_rx_antenna().is_some() {
             top += gap + crate::chrome::chip_width(ui, RX_ANT_LABEL, None);
         }
+
         if top > 0.0 {
             top += crate::chrome::text_width(ui, &tr!("topbar-ant-label"), body.clone());
         }
+
+        // The tuner can share the antenna row where the existing layout
+        // has both an antenna row and a power row. Otherwise it gets
+        // its own row.
+        let mut atu_row = 0.0f32;
+
+        if self.rig_atu().is_some() {
+            atu_row = crate::chrome::text_width(ui, "ATU", body.clone())
+                + gap
+                + crate::chrome::chip_width(ui, ATU_TUNE_LABEL, None)
+                    .max(crate::chrome::chip_width(ui, ATU_TUNING_LABEL, None))
+                + gap
+                + crate::chrome::chip_width(ui, ATU_BYPASS_LABEL, None);
+
+            if self.atu_in_ant_row() {
+                top += gap + atu_row;
+                atu_row = 0.0;
+            }
+        }
+
         let bottom = if self.rig_power() {
             crate::chrome::text_width(ui, &tr!("topbar-pwr-label"), body)
                 + gap
@@ -5277,10 +5310,12 @@ impl SdroxideApp {
         } else {
             0.0
         };
-        top.max(bottom) + 2.0 * crate::chrome::MODULE_MARGIN_X
-    }
 
-    /// The RIG box: the radio's aerial socket and its power switch.
+        top.max(bottom)
+            .max(atu_row)
+            + 2.0 * crate::chrome::MODULE_MARGIN_X
+    }
+    /// The RIG box: the radio's antenna, tuner and power controls.
     fn rig_module(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, w: f32) {
         crate::chrome::module_bare_h(ui, w, crate::chrome::MODULE_TALL_H, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -5289,9 +5324,7 @@ impl SdroxideApp {
             });
         });
     }
-
-    /// The radio's own switches — the body of the RIG box, and of the RIG
-    /// menu. See [`crate::chrome::control_row`] for `narrow`.
+    /// The radio's hardware controls — shared by the RIG box and its menus.
     ///
     /// The socket is a cycling chip rather than a combo, for the same reason
     /// the AGC and DIV chips are: a combo inside a menu opens a second popup
@@ -5346,6 +5379,18 @@ impl SdroxideApp {
                     self.state.rx_antenna = !on; // optimistic echo
                     cmds.push(Command::SetRxAntenna(!on));
                 }
+                if let Some(atu) = self.rig_atu()
+                    && self.atu_in_ant_row()
+                {
+                    Self::atu_chips(ui, cmds, atu);
+                }
+            });
+        }
+        if let Some(atu) = self.rig_atu()
+            && !self.atu_in_ant_row()
+        {
+            crate::chrome::control_row(ui, narrow, |ui| {
+                Self::atu_chips(ui, cmds, atu);
             });
         }
         if self.rig_power() {
@@ -5364,6 +5409,102 @@ impl SdroxideApp {
                     cmds.push(Command::SetRigPower(false));
                 }
             });
+        }
+    }
+
+    /// The antenna tuner's label and its two controls.
+    ///
+    /// The displayed state is always taken from the radio/source report.
+    /// Neither button changes the displayed state optimistically.
+    fn atu_chips(
+        ui: &mut egui::Ui,
+        cmds: &mut Vec<Command>,
+        atu: sdroxide_types::AtuState,
+    ) {
+        use sdroxide_types::AtuStatus;
+
+        let state = match atu.status {
+            AtuStatus::Idle => tr!("topbar-atu-idle"),
+            AtuStatus::Tuning => tr!("topbar-atu-tuning"),
+            AtuStatus::Tuned if atu.using_memory => {
+                tr!("topbar-atu-tuned-from-memory")
+            }
+            AtuStatus::Tuned => tr!("topbar-atu-tuned"),
+            AtuStatus::Bypass => tr!("topbar-atu-bypass"),
+            AtuStatus::Failed => tr!("topbar-atu-failed"),
+            AtuStatus::Aborted => tr!("topbar-atu-aborted"),
+        };
+
+        // This interface can drive an internally controlled radio tuner
+        // or a stand alone external tuner through the HPSDR I/O Board.
+        let mut hover = format!(
+            "{}",
+            tr!("topbar-atu-status", state = state)
+        );
+
+        if atu.reg7_supported {
+            if let Some(reg7) = atu.reg7_status {
+                let meaning = match reg7 {
+                    0x00 => "Idle / operation complete",
+                    0x01 => "Tune command accepted",
+                    0x02 => "Bypass command accepted",
+                    0x03 => "Tuner discovery pending",
+                    0x04 => "Bypass pulse active",
+                    0x05 => "Tune preparation; waiting for tuner KEY",
+                    0x08 => "Tune result confirmation; RF withdrawn",
+                    0xEE => "Tuner requests an RF carrier",
+                    0xFA => "Tune failed: tuner KEY input disconnected",
+                    0xFB => "Tune failed: KEY did not go low within 600 ms",
+                    0xFC => "Tune failed: tuner failure signal detected",
+                    0xFD => "Tune failed: tuner operation timed out (4 s)",
+                    _ => "Unknown Reg7 status",
+                };
+
+                let freshness = if atu.reg7_fresh { "fresh" } else { "stale" };
+
+                hover.push_str(&format!(
+                    "\nReg7: 0x{reg7:02X} — {meaning} ({freshness})"
+                ));
+            } else {
+                hover.push_str("\nReg7: unavailable");
+            }
+        }
+
+        if let Some(error) = atu.command_error {
+            let message = match error {
+                sdroxide_types::AtuCommandError::Rejected => {
+                    "Host rejected the command before delivery"
+                }
+                sdroxide_types::AtuCommandError::DeliveryFailed => {
+                    "Host could not deliver or confirm the command"
+                }
+            };
+
+            hover.push_str(&format!("\nCommand delivery: {message}"));
+        }
+
+        ui.label("ATU").on_hover_text(hover);
+
+        let tuning = atu.status == AtuStatus::Tuning;
+        let matched = atu.enabled && atu.status == AtuStatus::Tuned;
+        let label = if tuning {
+            ATU_TUNING_LABEL
+        } else {
+            ATU_TUNE_LABEL
+        };
+
+        if crate::chrome::chip(ui, tuning || matched, label)
+            .on_hover_text(tr!("topbar-atu-start-tune"))
+            .clicked()
+        {
+            cmds.push(Command::AtuTune);
+        }
+
+        if crate::chrome::chip(ui, !atu.enabled, ATU_BYPASS_LABEL)
+            .on_hover_text(tr!("topbar-atu-bypass-hint"))
+            .clicked()
+        {
+            cmds.push(Command::AtuBypass);
         }
     }
 

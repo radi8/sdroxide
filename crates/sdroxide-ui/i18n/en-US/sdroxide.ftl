@@ -1914,7 +1914,6 @@ topbar-diversity-filter-which-way-combines = The diversity filter: which way it 
 topbar-diversity = DIVERSITY
 topbar-second-receiver-s-frequency-mode = The second receiver's frequency, mode, filter and level
 topbar-sub-receiver = SUB RECEIVER
-topbar-transceiver-s-own-aerial-socket = The transceiver's own aerial socket, and its power switch
 topbar-radio = RADIO
 topbar-tune-voice-keyer-drive-mic = Tune, the voice keyer, and the drive and mic levels
 topbar-transmit = TRANSMIT
@@ -2310,6 +2309,20 @@ topbar-caption-surface = surface
 topbar-caption-flow = flow
 topbar-caption-detail = detail
 topbar-floor = floor
+
+topbar-radio-hardware-controls = Radio hardware controls: antennas, tuner and power
+
+topbar-atu-status = Antenna tuner: { $state }
+topbar-atu-idle = No tune since the radio started.
+topbar-atu-tuning = Tuning — a carrier is being transmitted into the tuner.
+topbar-atu-tuned-from-memory = Matched using a stored tuner setting for this frequency.
+topbar-atu-tuned = Matched.
+topbar-atu-bypass = Out of circuit.
+topbar-atu-failed = The last tune found no match.
+topbar-atu-aborted = The last tune was interrupted.
+
+topbar-atu-start-tune = Start tuning. The radio transmits a carrier while the tuner searches for a match; ensure the antenna is connected. Lit while a match is in circuit.
+topbar-atu-bypass-hint = Take the tuner out of circuit. Lit while it is bypassed.
 
 ## Digital-mode panel tabs (src/app/panels/mod.rs, pane_label).
 

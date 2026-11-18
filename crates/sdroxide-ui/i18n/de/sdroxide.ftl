@@ -1907,7 +1907,6 @@ topbar-diversity-filter-which-way-combines = Der Diversitätsfilter: in welcher 
 topbar-diversity = DIVERSITÄT
 topbar-second-receiver-s-frequency-mode = Die Frequenz, Betriebsart, das Filter und der Pegel des zweiten Empfängers
 topbar-sub-receiver = SUBEMPFÄNGER
-topbar-transceiver-s-own-aerial-socket = Die eigene Antennenbuchse des Transceivers und sein Netzschalter
 topbar-radio = FUNKGERÄT
 topbar-tune-voice-keyer-drive-mic = Tune, der Sprachkeyer und die Pegel für Aussteuerung und Mikrofon
 topbar-transmit = SENDEN

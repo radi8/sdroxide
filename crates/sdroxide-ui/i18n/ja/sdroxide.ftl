@@ -1893,7 +1893,6 @@ topbar-diversity-filter-which-way-combines = ダイバーシティフィルタ�
 topbar-diversity = ダイバーシティ
 topbar-second-receiver-s-frequency-mode = 2 つ目の受信機の周波数、モード、フィルター、レベル
 topbar-sub-receiver = サブ受信機
-topbar-transceiver-s-own-aerial-socket = トランシーバー自身のアンテナソケット、および電源スイッチ
 topbar-radio = 無線機
 topbar-tune-voice-keyer-drive-mic = 同調、音声キーヤー、駆動とマイクのレベル
 topbar-transmit = 送信

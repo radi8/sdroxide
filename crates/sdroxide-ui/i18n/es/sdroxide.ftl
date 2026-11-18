@@ -1908,7 +1908,6 @@ topbar-diversity-filter-which-way-combines = El filtro de diversidad: de qué ma
 topbar-diversity = DIVERSIDAD
 topbar-second-receiver-s-frequency-mode = La frecuencia, el modo, el filtro y el nivel del segundo receptor
 topbar-sub-receiver = SUBRECEPTOR
-topbar-transceiver-s-own-aerial-socket = El conector de antena propio del transceptor y su interruptor de encendido
 topbar-radio = RADIO
 topbar-tune-voice-keyer-drive-mic = Sintonizar, el manipulador de voz y los niveles de excitación y micrófono
 topbar-transmit = TRANSMISIÓN

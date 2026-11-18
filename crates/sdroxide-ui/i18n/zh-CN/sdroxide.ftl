@@ -1892,7 +1892,6 @@ topbar-diversity-filter-which-way-combines = 分集滤波器：以何种方式�
 topbar-diversity = 分集
 topbar-second-receiver-s-frequency-mode = 第二台接收机的频率、模式、滤波器和电平
 topbar-sub-receiver = 副接收机
-topbar-transceiver-s-own-aerial-socket = 收发信机自身的天线插座及其电源开关
 topbar-radio = 电台
 topbar-tune-voice-keyer-drive-mic = 调谐、语音键控器，以及驱动和话筒电平
 topbar-transmit = 发射
